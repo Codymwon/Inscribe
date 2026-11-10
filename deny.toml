@@ -1,0 +1,57 @@
+# Configuration for cargo-deny to enforce supply chain security and mitigate CVE-2026-77649
+
+[graph]
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+    "aarch64-pc-windows-msvc",
+]
+
+[advisories]
+vulnerability = "deny"
+unmaintained = "deny"
+yanked = "deny"
+notice = "warn"
+severity-threshold = "low"
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+deny = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+
+[licenses]
+unlicensed = "deny"
+confidence-threshold = 0.8
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "OpenSSL",
+    "GPL-3.0-only",
+]
+exceptions = [
+    { allow = ["LicenseRef-Slint-Royalty-free-2.0", "GPL-3.0-only"], crate = "slint" },
+    { allow = ["LicenseRef-Slint-Royalty-free-2.0", "GPL-3.0-only"], crate = "slint-build" },
+    { allow = ["LicenseRef-Slint-Royalty-free-2.0", "GPL-3.0-only"], crate = "i-slint-core" },
+    { allow = ["LicenseRef-Slint-Royalty-free-2.0", "GPL-3.0-only"], crate = "i-slint-common" },
+    { allow = ["LicenseRef-Slint-Royalty-free-2.0", "GPL-3.0-only"], crate = "i-slint-compiler" },
+    { allow = ["LicenseRef-Slint-Royalty-free-2.0", "GPL-3.0-only"], crate = "i-slint-backend-selector" },
+    { allow = ["LicenseRef-Slint-Royalty-free-2.0", "GPL-3.0-only"], crate = "i-slint-backend-winit" },
+    { allow = ["LicenseRef-Slint-Royalty-free-2.0", "GPL-3.0-only"], crate = "i-slint-renderer-femtovg" },
+    { allow = ["LicenseRef-Slint-Royalty-free-2.0", "GPL-3.0-only"], crate = "i-slint-renderer-software" },
+]
