@@ -2520,6 +2520,7 @@ dependencies = [
  "bzip2 0.6.1",
  "crossbeam-channel",
  "flate2",
+ "libc",
  "lzma-rust2",
  "serde",
  "serde_json",
