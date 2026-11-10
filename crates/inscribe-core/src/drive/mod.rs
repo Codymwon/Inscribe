@@ -1,4 +1,10 @@
-//! Core drive detection and storage hardware domain models.
+//! Core drive detection, storage hardware domain models, and Drive Guard safety engine.
+
+pub mod guard;
+pub mod mock;
+
+pub use guard::DriveGuard;
+pub use mock::{DriveScanner, MockDriveScanner};
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;

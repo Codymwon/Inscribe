@@ -7,7 +7,7 @@ pub mod progress;
 pub mod target;
 
 // Re-exports for convenient top-level access
-pub use drive::{BusType, DriveInfo};
+pub use drive::{BusType, DriveGuard, DriveInfo, DriveScanner, MockDriveScanner};
 pub use error::InscribeError;
 pub use image::{ImageFormat, ImageMetadata};
 pub use progress::{FlashPhase, FlashProgress};
