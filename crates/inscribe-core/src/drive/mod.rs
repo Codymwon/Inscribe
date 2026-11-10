@@ -1,9 +1,13 @@
 //! Core drive detection, storage hardware domain models, and Drive Guard safety engine.
 
 pub mod guard;
+#[cfg(target_os = "linux")]
+pub mod linux;
 pub mod mock;
 
 pub use guard::DriveGuard;
+#[cfg(target_os = "linux")]
+pub use linux::LinuxDriveScanner;
 pub use mock::{DriveScanner, MockDriveScanner};
 
 use serde::{Deserialize, Serialize};
