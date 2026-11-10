@@ -4,11 +4,15 @@ pub mod guard;
 #[cfg(target_os = "linux")]
 pub mod linux;
 pub mod mock;
+#[cfg(target_os = "linux")]
+pub mod udisks;
 
 pub use guard::DriveGuard;
 #[cfg(target_os = "linux")]
 pub use linux::LinuxDriveScanner;
 pub use mock::{DriveScanner, MockDriveScanner};
+#[cfg(target_os = "linux")]
+pub use udisks::UDisksClient;
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
