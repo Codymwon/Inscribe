@@ -1,0 +1,67 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/inscribe-core",
+    "crates/inscribe-cli",
+    "crates/inscribe-gui",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["Inscribe Contributors"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/inscribe/inscribe"
+rust-version = "1.85.0"
+
+[workspace.dependencies]
+# Shared internal crates
+inscribe-core = { path = "crates/inscribe-core" }
+
+# Async runtime & channels
+tokio = { version = "1.43", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync"] }
+crossbeam-channel = "0.5.14"
+
+# Cryptographic hashing
+blake3 = "1.6"
+sha2 = "0.10.8"
+
+# Error handling
+thiserror = "2.0.11"
+
+# Transparent streaming decompression
+lzma-rust2 = "0.25.0"
+flate2 = "1.1.11"
+zstd = "0.13.3"
+bzip2 = "0.6.1"
+zip = { version = "2.5.0", default-features = false, features = ["deflate", "bzip2", "zstd", "lzma"] }
+
+# Linux D-Bus & UDisks2
+zbus = { version = "5.5.0", default-features = false, features = ["tokio"] }
+
+# Slint Native GUI toolkit (strictly without Skia to maintain sub-10MB binary footprint)
+slint = { version = "1.18.1", default-features = false, features = [
+    "std",
+    "compat-1-18",
+    "backend-winit",
+    "renderer-femtovg",
+    "renderer-software",
+    "accessibility",
+] }
+slint-build = "1.18.1"
+swash = "0.1.19"
+
+# CLI helpers
+clap = { version = "4.5.31", features = ["derive"] }
+indicatif = "0.17.11"
+
+# Logging / Diagnostics
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

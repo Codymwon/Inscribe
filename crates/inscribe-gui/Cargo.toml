@@ -1,0 +1,19 @@
+[package]
+name = "inscribe-gui"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "inscribe-gui"
+path = "src/main.rs"
+
+[dependencies]
+inscribe-core.workspace = true
+slint.workspace = true
+crossbeam-channel.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
