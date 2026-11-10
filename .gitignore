@@ -1,0 +1,29 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+*.lcov
+lcov.info
+
+# Sensitive & environment files
+.env
+.env.*
+*.pem
+*.key
+*.pfx
+*.p12
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE & editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Task tracking & planning
+tasks/plan.md
+tasks/todo.md
+
