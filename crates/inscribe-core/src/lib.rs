@@ -3,6 +3,7 @@
 pub mod drive;
 pub mod error;
 pub mod image;
+pub mod pipeline;
 pub mod progress;
 pub mod target;
 pub mod writer;
@@ -14,6 +15,7 @@ pub use image::{
     CountingReader, ImageFormat, ImageMetadata, detect_format, detect_from_path, inspect_image,
     open_decompressor, open_seekable_decompressor,
 };
+pub use pipeline::{FlashHandle, FlashPipeline, FlashSummary, PipelineOptions};
 pub use progress::{FlashPhase, FlashProgress};
 pub use target::{BlockTarget, MultiBlockTarget};
 pub use writer::{AlignedBuffer, BlockDeviceWriter, WriterOptions};
