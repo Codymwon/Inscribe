@@ -171,23 +171,29 @@ pub struct OsPrivilegeDetector;
 
 impl PrivilegeDetector for OsPrivilegeDetector {
     fn is_elevated(&self) -> bool {
-        #[cfg(unix)]
-        {
-            // POSIX geteuid(2): UID 0 indicates the superuser / root.
-            // Source: <https://pubs.opengroup.org/onlinepubs/9699919799/functions/geteuid.html>
-            unsafe { libc::geteuid() == 0 }
-        }
+        match TEST_OVERRIDE_ELEVATED.load(Ordering::SeqCst) {
+            0 => false,
+            1 => true,
+            _ => {
+                #[cfg(unix)]
+                {
+                    // POSIX geteuid(2): UID 0 indicates the superuser / root.
+                    // Source: <https://pubs.opengroup.org/onlinepubs/9699919799/functions/geteuid.html>
+                    unsafe { libc::geteuid() == 0 }
+                }
 
-        #[cfg(windows)]
-        {
-            // On Windows, query process token elevation.
-            // Source: <https://learn.microsoft.com/en-us/windows/win32/api/securitybaseapi/nf-securitybaseapi-gettokeninformation>
-            windows_check_elevation()
-        }
+                #[cfg(windows)]
+                {
+                    // On Windows, query process token elevation.
+                    // Source: <https://learn.microsoft.com/en-us/windows/win32/api/securitybaseapi/nf-securitybaseapi-gettokeninformation>
+                    windows_check_elevation()
+                }
 
-        #[cfg(not(any(unix, windows)))]
-        {
-            false
+                #[cfg(not(any(unix, windows)))]
+                {
+                    false
+                }
+            }
         }
     }
 }

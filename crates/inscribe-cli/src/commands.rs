@@ -130,45 +130,43 @@ pub fn run_flash<R: BufRead, W: Write>(
         if let Some(target_drive) = drives.iter().find(|d| d.path == args.device) {
             DriveGuard::validate_target_with_options(target_drive, args.allow_usb_ssd)?;
         } else {
-            // Target path not found in enumerated devices - check if path is a known system mount
-            if inscribe_core::drive::guard::is_system_mount(&args.device) {
-                return Err(InscribeError::drive_guard_violation(
-                    &args.device,
-                    format!(
-                        "Target device '{}' contains critical OS system mounts and cannot be overwritten",
-                        args.device.display()
-                    ),
-                ));
-            }
+            // Target path not found in enumerated devices - fail closed unless unsafe override enabled
+            return Err(InscribeError::drive_guard_violation(
+                &args.device,
+                format!(
+                    "Target device '{}' was not found among detected safe removable drives. To flash an unverified target, pass --unsafe-allow-system-drives and confirm.",
+                    args.device.display()
+                ),
+            ));
         }
     }
 
     // 3. Privilege warning/guidance
     let priv_mgr = PrivilegeManager::new();
     if !priv_mgr.check_elevated() {
-        let strategy = priv_mgr.recommended_strategy();
-        if !strategy.supports_unprivileged_udisks() {
-            let args_vec: Vec<String> = std::env::args().collect();
-            let str_refs: Vec<&str> = args_vec.iter().map(String::as_str).collect();
-            let program = args_vec.first().map(String::as_str).unwrap_or("inscribe");
-            let rest_args = if args_vec.len() > 1 {
-                &str_refs[1..]
-            } else {
-                &[]
-            };
+        let args_vec: Vec<String> = std::env::args().collect();
+        let str_refs: Vec<&str> = args_vec.iter().map(String::as_str).collect();
+        let program = args_vec.first().map(String::as_str).unwrap_or("inscribe");
+        let rest_args = if args_vec.len() > 1 {
+            &str_refs[1..]
+        } else {
+            &[]
+        };
 
-            let cmd_str = priv_mgr
-                .generate_elevation_command(program, rest_args)
-                .map(|c| c.to_shell_string())
-                .unwrap_or_else(|| "sudo inscribe ...".to_string());
+        let cmd_str = priv_mgr
+            .generate_elevation_command(program, rest_args)
+            .map(|c| c.to_shell_string())
+            .unwrap_or_else(|| {
+                inscribe_core::privilege::ElevationCommand::sudo(program, rest_args)
+                    .to_shell_string()
+            });
 
-            writeln!(
-                stdout,
-                "Note: Elevated permissions may be required to write directly to block devices."
-            )?;
-            writeln!(stdout, "Recommended command: {cmd_str}")?;
-            stdout.flush()?;
-        }
+        writeln!(
+            stdout,
+            "Note: Elevated permissions may be required to write directly to block devices."
+        )?;
+        writeln!(stdout, "Recommended command: {cmd_str}")?;
+        stdout.flush()?;
     }
 
     // 4. Open streaming decompressor (zero temporary host storage writes)

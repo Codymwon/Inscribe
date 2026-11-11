@@ -552,3 +552,106 @@ fn test_run_flash_unsafe_override_aborts_on_prompt_failure() {
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
+
+// -----------------------------------------------------------------------------
+// Test 10: Task 10.5: `run_flash` fails closed on unenumerated target paths
+// -----------------------------------------------------------------------------
+#[test]
+fn test_run_flash_blocks_unenumerated_target_path_fail_closed() {
+    let temp_dir = scratch_dir("inscribe_test_fail_closed");
+    let image_path = temp_dir.join("image.iso");
+    std::fs::write(&image_path, vec![0u8; 512 * 1024]).unwrap();
+
+    // Scanner enumerates only /dev/sdb
+    let safe_usb = make_drive(MockDriveParams {
+        path: "/dev/sdb",
+        model: "USB Flash",
+        vendor: "SanDisk",
+        size: 32_000_000_000,
+        bus: BusType::Usb,
+        removable: true,
+        system: false,
+        mounts: vec![],
+    });
+    let scanner = inscribe_core::drive::MockDriveScanner::new(vec![safe_usb]);
+
+    // User specifies an unenumerated device /dev/sdz without --unsafe-allow-system-drives
+    let flash_args = FlashArgs {
+        image: image_path,
+        device: PathBuf::from("/dev/sdz"),
+        verify_sha256: None,
+        unsafe_allow_system_drives: false,
+        allow_usb_ssd: false,
+        no_verify: false,
+    };
+
+    let mut stdin = Cursor::new(b"");
+    let mut stdout = Vec::new();
+
+    let result = inscribe_cli::commands::run_flash(&flash_args, &mut stdin, &mut stdout, &scanner);
+    assert!(
+        result.is_err(),
+        "Must fail closed for unenumerated target device path"
+    );
+
+    let err_str = result.unwrap_err().to_string();
+    assert!(
+        err_str.contains("Drive Guard rejected destination")
+            || err_str.contains("not found among detected safe removable drives"),
+        "Error must describe fail-closed Drive Guard rejection: {err_str}"
+    );
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+// -----------------------------------------------------------------------------
+// Test 11: Task 10.5: `run_flash` displays elevation guidance when run unelevated
+// -----------------------------------------------------------------------------
+#[test]
+fn test_run_flash_displays_elevation_guidance_when_unelevated() {
+    let temp_dir = scratch_dir("inscribe_test_elevation_guidance");
+    let image_path = temp_dir.join("image.iso");
+    std::fs::write(&image_path, vec![0u8; 512 * 1024]).unwrap();
+
+    // Force unelevated state in PrivilegeManager test override
+    inscribe_core::privilege::PrivilegeManager::set_test_override(Some(false));
+
+    let safe_usb = make_drive(MockDriveParams {
+        path: "/dev/sdb",
+        model: "USB Flash",
+        vendor: "SanDisk",
+        size: 32_000_000_000,
+        bus: BusType::Usb,
+        removable: true,
+        system: false,
+        mounts: vec![],
+    });
+    let scanner = inscribe_core::drive::MockDriveScanner::new(vec![safe_usb]);
+
+    let flash_args = FlashArgs {
+        image: image_path,
+        device: PathBuf::from("/dev/sdb"),
+        verify_sha256: None,
+        unsafe_allow_system_drives: false,
+        allow_usb_ssd: false,
+        no_verify: false,
+    };
+
+    let mut stdin = Cursor::new(b"");
+    let mut stdout = Vec::new();
+
+    // Note: run_flash will attempt to open /dev/sdb which does not exist as block device in unit test,
+    // but before opening the target it must output elevation guidance if unelevated!
+    let _ = inscribe_cli::commands::run_flash(&flash_args, &mut stdin, &mut stdout, &scanner);
+
+    let out_str = String::from_utf8_lossy(&stdout);
+    assert!(
+        out_str.contains("Elevated permissions may be required")
+            || out_str.contains("Recommended command"),
+        "Stdout must display elevation guidance when running unelevated. Got: '{out_str}'"
+    );
+
+    // Reset test override
+    inscribe_core::privilege::PrivilegeManager::set_test_override(None);
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
