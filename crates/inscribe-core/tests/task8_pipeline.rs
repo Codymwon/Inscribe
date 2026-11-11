@@ -355,6 +355,42 @@ fn test_insufficient_capacity_rejected() {
 }
 
 #[test]
+fn test_indeterminate_streaming_insufficient_capacity_rejected() {
+    // 3MB payload in indeterminate streaming mode (expected_size: None)
+    let payload = vec![0x33u8; 3 * 1024 * 1024];
+    // Target has only 1MB capacity
+    let mut target = VirtualBlockTarget::new(1024 * 1024, 4096);
+
+    let options = PipelineOptions {
+        expected_size: None, // Indeterminate streaming mode (e.g. .bz2, >4GB .gz, streaming archive)
+        verify: false,
+        expected_sha256: None,
+        chunk_size: 64 * 1024,
+        telemetry_rate_hz: 60,
+    };
+
+    let (progress_tx, _) = crossbeam_channel::unbounded();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let mut reader = Cursor::new(payload);
+
+    let result = FlashPipeline::new(options).run(&mut reader, &mut target, &progress_tx, &cancel);
+
+    match result {
+        Err(InscribeError::InsufficientCapacity {
+            target_bytes,
+            image_bytes,
+        }) => {
+            assert_eq!(target_bytes, 1024 * 1024);
+            assert!(
+                image_bytes > 1024 * 1024,
+                "Reported image bytes {image_bytes} must exceed target capacity"
+            );
+        }
+        other => panic!("Expected InsufficientCapacity, got {:?}", other),
+    }
+}
+
+#[test]
 fn test_pipeline_zero_disk_buffering_with_compressed_image() {
     // Generate raw payload and compress it in memory using flate2 (gzip)
     let raw_payload = generate_test_data(512 * 1024);

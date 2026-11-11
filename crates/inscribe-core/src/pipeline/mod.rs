@@ -129,19 +129,20 @@ impl FlashPipeline {
         progress_tx: &crossbeam_channel::Sender<FlashProgress>,
         cancel_token: &AtomicBool,
     ) -> Result<FlashSummary, InscribeError> {
+        // Query target capacity up front
+        let target_capacity = target.capacity().unwrap_or(0);
+
         // Enforce capacity check if image size is known
         if let Some(image_bytes) = self.options.expected_size {
-            if let Ok(target_capacity) = target.capacity() {
-                if target_capacity > 0 && target_capacity < image_bytes {
-                    let mut tracker =
-                        ProgressTracker::new(Some(image_bytes), 1, self.options.telemetry_rate_hz);
-                    tracker.set_phase(FlashPhase::Failed, 1, Some(image_bytes));
-                    tracker.emit(progress_tx, true);
-                    return Err(InscribeError::InsufficientCapacity {
-                        target_bytes: target_capacity,
-                        image_bytes,
-                    });
-                }
+            if target_capacity > 0 && target_capacity < image_bytes {
+                let mut tracker =
+                    ProgressTracker::new(Some(image_bytes), 1, self.options.telemetry_rate_hz);
+                tracker.set_phase(FlashPhase::Failed, 1, Some(image_bytes));
+                tracker.emit(progress_tx, true);
+                return Err(InscribeError::InsufficientCapacity {
+                    target_bytes: target_capacity,
+                    image_bytes,
+                });
             }
         }
 
@@ -210,6 +211,15 @@ impl FlashPipeline {
 
             if bytes_in_buf == 0 {
                 break;
+            }
+
+            if target_capacity > 0 && offset + bytes_in_buf as u64 > target_capacity {
+                tracker.set_phase(FlashPhase::Failed, 1, self.options.expected_size);
+                tracker.emit(progress_tx, true);
+                return Err(InscribeError::InsufficientCapacity {
+                    target_bytes: target_capacity,
+                    image_bytes: offset + bytes_in_buf as u64,
+                });
             }
 
             let slice = &buffer[..bytes_in_buf];
