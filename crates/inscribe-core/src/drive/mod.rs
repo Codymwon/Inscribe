@@ -18,6 +18,27 @@ pub use mock::{DriveScanner, MockDriveScanner};
 pub use udisks::UDisksClient;
 pub use windows::WindowsDriveScanner;
 
+/// Returns the default platform block drive scanner.
+#[must_use]
+pub fn default_scanner() -> Box<dyn DriveScanner> {
+    #[cfg(target_os = "linux")]
+    {
+        Box::new(LinuxDriveScanner::new())
+    }
+    #[cfg(target_os = "windows")]
+    {
+        Box::new(WindowsDriveScanner::new())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Box::new(MacOsDriveScanner::new())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+    {
+        Box::new(MockDriveScanner::empty())
+    }
+}
+
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 

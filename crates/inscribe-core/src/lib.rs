@@ -10,7 +10,7 @@ pub mod target;
 pub mod writer;
 
 // Re-exports for convenient top-level access
-pub use drive::{BusType, DriveGuard, DriveInfo, DriveScanner, MockDriveScanner};
+pub use drive::{BusType, DriveGuard, DriveInfo, DriveScanner, MockDriveScanner, default_scanner};
 pub use error::InscribeError;
 pub use image::{
     CountingReader, ImageFormat, ImageMetadata, detect_format, detect_from_path, inspect_image,
