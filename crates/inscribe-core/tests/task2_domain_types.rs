@@ -309,3 +309,56 @@ fn test_multi_target_fanout() {
         assert_eq!(target.capacity().unwrap(), 2048);
     }
 }
+
+#[test]
+fn test_multi_target_read_block_validates_secondary_targets() {
+    let target1 = Box::new(TestMockTarget::new("target_0", 2048, 512));
+    let target2 = Box::new(TestMockTarget::new("target_1", 2048, 512));
+    let target3 = Box::new(TestMockTarget::new("target_2", 2048, 512));
+
+    let targets: Vec<Box<dyn BlockTarget>> = vec![target1, target2, target3];
+    let mut multi = MultiBlockTarget::new(targets);
+
+    let payload = [0x77; 1024];
+    multi.write_block(0, &payload).expect("write failed");
+
+    // All 3 targets have identical payload -> read_block succeeds
+    let mut read_buf = [0u8; 1024];
+    multi
+        .read_block(0, &mut read_buf)
+        .expect("identical secondary targets must succeed");
+    assert_eq!(read_buf, payload);
+
+    // Tamper with target_2 (index 2) at offset 50
+    let mut corrupt = [0x77; 1024];
+    corrupt[50] = 0xDE;
+    multi.targets_mut()[2]
+        .write_block(0, &corrupt)
+        .expect("tamper write failed");
+
+    let result = multi.read_block(0, &mut read_buf);
+    assert!(
+        result.is_err(),
+        "read_block must validate all secondary targets and fail on mismatch"
+    );
+
+    let err = result.unwrap_err();
+    match err {
+        InscribeError::VerificationFailed {
+            offset,
+            expected,
+            actual,
+        } => {
+            assert_eq!(offset, 50, "Verification mismatch must point to offset 50");
+            assert!(
+                expected.contains("target_0") || expected.contains("bitstream"),
+                "Expected string must reference target 0: {expected}"
+            );
+            assert!(
+                actual.contains("target_2") || actual.contains("mismatch"),
+                "Actual string must reference target 2 mismatch: {actual}"
+            );
+        }
+        other => panic!("Expected InscribeError::VerificationFailed, got {other:?}"),
+    }
+}

@@ -140,12 +140,43 @@ impl BlockTarget for MultiBlockTarget {
     }
 
     fn read_block(&mut self, offset: u64, buffer: &mut [u8]) -> Result<(), InscribeError> {
-        let first = self.targets.first_mut().ok_or_else(|| {
-            InscribeError::MultiTargetError(
+        if self.targets.is_empty() {
+            return Err(InscribeError::MultiTargetError(
                 "Cannot read block: No block targets configured in MultiBlockTarget".to_string(),
-            )
-        })?;
-        first.read_block(offset, buffer)
+            ));
+        }
+
+        // Read primary bitstream from target 0
+        self.targets[0].read_block(offset, buffer)?;
+
+        if self.targets.len() > 1 {
+            let target0_id = self.targets[0].id().to_string();
+            let mut secondary_buf = vec![0u8; buffer.len()];
+
+            for (idx, target) in self.targets.iter_mut().enumerate().skip(1) {
+                target.read_block(offset, &mut secondary_buf)?;
+
+                if secondary_buf != buffer {
+                    let mismatch_pos = secondary_buf
+                        .iter()
+                        .zip(buffer.iter())
+                        .position(|(a, b)| a != b)
+                        .unwrap_or(0);
+
+                    return Err(InscribeError::VerificationFailed {
+                        offset: offset + mismatch_pos as u64,
+                        expected: format!("target 0 ({target0_id}) bitstream"),
+                        actual: format!(
+                            "secondary target {} ({}) bitstream mismatch",
+                            idx,
+                            target.id()
+                        ),
+                    });
+                }
+            }
+        }
+
+        Ok(())
     }
 
     fn invalidate_cache(&mut self) -> Result<(), InscribeError> {
