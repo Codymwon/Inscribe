@@ -92,17 +92,7 @@ impl DriveInfo {
     /// Determines whether this target is safe and eligible for flashing.
     #[must_use]
     pub fn is_flashable(&self, allow_usb_ssd: bool) -> bool {
-        if self.is_system || self.is_read_only {
-            return false;
-        }
-
-        if self.is_removable {
-            self.bus_type.is_removable_bus()
-        } else if allow_usb_ssd {
-            self.is_external_usb_ssd()
-        } else {
-            false
-        }
+        DriveGuard::validate_target_with_options(self, allow_usb_ssd).is_ok()
     }
 
     /// Returns a human-friendly formatted representation of the drive capacity (e.g. "32.0 GB").

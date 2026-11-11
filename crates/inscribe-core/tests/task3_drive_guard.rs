@@ -282,3 +282,47 @@ fn test_mock_drive_scanner_operations_and_guard_filtering() {
     scanner.clear();
     assert_eq!(scanner.scan_drives().unwrap().len(), 0);
 }
+
+#[test]
+fn test_drive_info_is_flashable_unifies_with_drive_guard() {
+    let valid_usb = create_base_drive("/dev/sdb", BusType::Usb, true);
+    assert!(valid_usb.is_flashable(false));
+    assert!(valid_usb.is_flashable(true));
+
+    // Zero-size drive must NOT be flashable
+    let mut zero_size = valid_usb.clone();
+    zero_size.size = 0;
+    assert!(
+        !zero_size.is_flashable(false),
+        "Zero-size drive must not be flashable"
+    );
+
+    // Drive with critical system mount must NOT be flashable
+    let mut root_mounted = valid_usb.clone();
+    root_mounted.mount_points = vec![PathBuf::from("/")];
+    assert!(
+        !root_mounted.is_flashable(false),
+        "Root mounted drive must not be flashable"
+    );
+
+    let mut home_mounted = valid_usb.clone();
+    home_mounted.mount_points = vec![PathBuf::from("/home")];
+    assert!(
+        !home_mounted.is_flashable(false),
+        "Home mounted drive must not be flashable"
+    );
+
+    // External USB SSD opt-in behavior
+    let usb_ssd = create_base_drive("/dev/sdc", BusType::Usb, false);
+    assert!(!usb_ssd.is_flashable(false));
+    assert!(usb_ssd.is_flashable(true));
+
+    let mut usb_ssd_with_root = usb_ssd.clone();
+    usb_ssd_with_root.mount_points = vec![PathBuf::from("/")];
+    assert!(!usb_ssd_with_root.is_flashable(true));
+
+    // Internal NVMe drive must never be flashable
+    let nvme = create_base_drive("/dev/nvme0n1", BusType::Nvme, false);
+    assert!(!nvme.is_flashable(false));
+    assert!(!nvme.is_flashable(true));
+}
