@@ -355,7 +355,6 @@ fn test_streaming_zip_skips_directories_and_macos_metadata() {
     );
 }
 
-
 // Mock seekable reader to simulate large Gzip files (> 4 GiB) without allocating host disk/RAM
 struct MockGzipStream {
     file_size: u64,
