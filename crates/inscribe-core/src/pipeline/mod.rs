@@ -129,14 +129,19 @@ impl FlashPipeline {
         progress_tx: &crossbeam_channel::Sender<FlashProgress>,
         cancel_token: &AtomicBool,
     ) -> Result<FlashSummary, InscribeError> {
+        let total_passes = if self.options.verify { 2 } else { 1 };
+        let mut tracker = ProgressTracker::new(
+            self.options.expected_size,
+            total_passes,
+            self.options.telemetry_rate_hz,
+        );
+
         // Query target capacity up front
         let target_capacity = target.capacity().unwrap_or(0);
 
         // Enforce capacity check if image size is known
         if let Some(image_bytes) = self.options.expected_size {
             if target_capacity > 0 && target_capacity < image_bytes {
-                let mut tracker =
-                    ProgressTracker::new(Some(image_bytes), 1, self.options.telemetry_rate_hz);
                 tracker.set_phase(FlashPhase::Failed, 1, Some(image_bytes));
                 tracker.emit(progress_tx, true);
                 return Err(InscribeError::InsufficientCapacity {
@@ -147,22 +152,11 @@ impl FlashPipeline {
         }
 
         if cancel_token.load(Ordering::Relaxed) {
-            let mut tracker = ProgressTracker::new(
-                self.options.expected_size,
-                1,
-                self.options.telemetry_rate_hz,
-            );
             tracker.set_phase(FlashPhase::Cancelled, 1, self.options.expected_size);
             tracker.emit(progress_tx, true);
             return Err(InscribeError::Cancelled);
         }
 
-        let total_passes = if self.options.verify { 2 } else { 1 };
-        let mut tracker = ProgressTracker::new(
-            self.options.expected_size,
-            total_passes,
-            self.options.telemetry_rate_hz,
-        );
         tracker.emit(progress_tx, true);
 
         let chunk_size = self.options.chunk_size.max(4096);
@@ -182,36 +176,21 @@ impl FlashPipeline {
         let mut offset = 0u64;
 
         loop {
-            if cancel_token.load(Ordering::Relaxed) {
-                tracker.set_phase(FlashPhase::Cancelled, 1, self.options.expected_size);
-                tracker.emit(progress_tx, true);
-                return Err(InscribeError::Cancelled);
-            }
-
-            // Fill the chunk buffer up to chunk_size or EOF
-            let mut bytes_in_buf = 0;
-            while bytes_in_buf < chunk_size {
-                if cancel_token.load(Ordering::Relaxed) {
-                    tracker.set_phase(FlashPhase::Cancelled, 1, self.options.expected_size);
-                    tracker.emit(progress_tx, true);
-                    return Err(InscribeError::Cancelled);
-                }
-
-                let n = reader.read(&mut buffer[bytes_in_buf..]).map_err(|e| {
-                    tracker.set_phase(FlashPhase::Failed, 1, self.options.expected_size);
-                    tracker.emit(progress_tx, true);
-                    InscribeError::Io(e)
-                })?;
-
-                if n == 0 {
-                    break;
-                }
-                bytes_in_buf += n;
-            }
-
-            if bytes_in_buf == 0 {
-                break;
-            }
+            let bytes_in_buf =
+                match read_chunk_or_eof(reader, &mut buffer[..chunk_size], cancel_token) {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(InscribeError::Cancelled) => {
+                        tracker.set_phase(FlashPhase::Cancelled, 1, self.options.expected_size);
+                        tracker.emit(progress_tx, true);
+                        return Err(InscribeError::Cancelled);
+                    }
+                    Err(e) => {
+                        tracker.set_phase(FlashPhase::Failed, 1, self.options.expected_size);
+                        tracker.emit(progress_tx, true);
+                        return Err(e);
+                    }
+                };
 
             if target_capacity > 0 && offset + bytes_in_buf as u64 > target_capacity {
                 tracker.set_phase(FlashPhase::Failed, 1, self.options.expected_size);
@@ -333,4 +312,25 @@ impl FlashPipeline {
             average_mb_per_sec,
         })
     }
+}
+
+/// Reads from `reader` into `buf` until `buf` is completely filled or EOF is reached,
+/// checking `cancel_token` before each read operation.
+fn read_chunk_or_eof<R: Read>(
+    reader: &mut R,
+    buf: &mut [u8],
+    cancel_token: &AtomicBool,
+) -> Result<usize, InscribeError> {
+    let mut bytes_read = 0;
+    while bytes_read < buf.len() {
+        if cancel_token.load(Ordering::Relaxed) {
+            return Err(InscribeError::Cancelled);
+        }
+        let n = reader.read(&mut buf[bytes_read..])?;
+        if n == 0 {
+            break;
+        }
+        bytes_read += n;
+    }
+    Ok(bytes_read)
 }
