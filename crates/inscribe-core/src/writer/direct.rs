@@ -366,6 +366,20 @@ impl BlockTarget for BlockDeviceWriter {
 
         Ok(())
     }
+
+    fn invalidate_cache(&mut self) -> Result<(), InscribeError> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = self.file.as_raw_fd();
+            unsafe {
+                libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_DONTNEED);
+                const BLKFLSBUF: u64 = 0x1261;
+                libc::ioctl(fd, BLKFLSBUF as _);
+            }
+        }
+        Ok(())
+    }
 }
 
 impl BlockDeviceWriter {

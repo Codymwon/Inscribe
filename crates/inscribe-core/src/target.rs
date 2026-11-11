@@ -27,6 +27,11 @@ pub trait BlockTarget: Send {
 
     /// Read back a chunk of data at the specified byte offset for verification.
     fn read_block(&mut self, offset: u64, buffer: &mut [u8]) -> Result<(), InscribeError>;
+
+    /// Invalidate operating system page/buffer cache before verification read-back.
+    fn invalidate_cache(&mut self) -> Result<(), InscribeError> {
+        Ok(())
+    }
 }
 
 /// Fan-out container supporting simultaneous flashing across multiple physical block targets (`Vec<Box<dyn BlockTarget>>`).
@@ -141,5 +146,12 @@ impl BlockTarget for MultiBlockTarget {
             )
         })?;
         first.read_block(offset, buffer)
+    }
+
+    fn invalidate_cache(&mut self) -> Result<(), InscribeError> {
+        for target in &mut self.targets {
+            target.invalidate_cache()?;
+        }
+        Ok(())
     }
 }
