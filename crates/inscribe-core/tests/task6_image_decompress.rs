@@ -293,3 +293,65 @@ fn test_corrupt_data_returns_decompression_failed() {
         err.kind()
     );
 }
+
+// Struct implementing Read + Send without Seek to simulate non-seekable streams
+struct NonSeekableStream<R>(R);
+
+impl<R: Read> Read for NonSeekableStream<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.0.read(buf)
+    }
+}
+
+#[test]
+fn test_streaming_zip_skips_directories_and_macos_metadata() {
+    use zip::ZipWriter;
+    use zip::write::SimpleFileOptions;
+
+    let mut cursor = Cursor::new(Vec::new());
+    let mut zip = ZipWriter::new(&mut cursor);
+
+    // Entry 1: Directory header
+    zip.add_directory("distro/", SimpleFileOptions::default())
+        .expect("add_directory failed");
+
+    // Entry 2: macOS metadata directory
+    zip.add_directory("__MACOSX/", SimpleFileOptions::default())
+        .expect("add __MACOSX failed");
+
+    // Entry 3: macOS resource fork dot-underscore file
+    zip.start_file("__MACOSX/._distro", SimpleFileOptions::default())
+        .expect("add resource fork failed");
+    zip.write_all(b"RESOURCE_FORK_METADATA")
+        .expect("write failed");
+
+    // Entry 4: another dot-underscore file inside distro/
+    zip.start_file("distro/._os.raw", SimpleFileOptions::default())
+        .expect("add dot-underscore file failed");
+    zip.write_all(b"METADATA_HEADER").expect("write failed");
+
+    // Entry 5: Actual disk image payload
+    let real_payload = b"GENUINE_OPERATING_SYSTEM_RAW_DISK_IMAGE_PAYLOAD";
+    zip.start_file("distro/os.raw", SimpleFileOptions::default())
+        .expect("add real file failed");
+    zip.write_all(real_payload).expect("write failed");
+
+    zip.finish().expect("zip finish failed");
+    let zip_bytes = cursor.into_inner();
+
+    // Pass non-seekable stream to open_decompressor
+    let non_seekable = NonSeekableStream(Cursor::new(zip_bytes));
+    let mut decompressor = open_decompressor(non_seekable, ImageFormat::Zip)
+        .expect("open_decompressor streaming zip failed");
+
+    let mut decompressed = Vec::new();
+    decompressor
+        .read_to_end(&mut decompressed)
+        .expect("streaming zip read_to_end failed");
+
+    assert_eq!(
+        decompressed, real_payload,
+        "Streaming non-seekable ZIP decompressor must skip folder headers and macOS metadata to find the real image"
+    );
+}
+

@@ -116,29 +116,45 @@ pub fn open_decompressor<R: Read + Send + 'static>(
             let (tx, rx) = crossbeam_channel::bounded::<std::io::Result<Vec<u8>>>(16);
             let handle = std::thread::spawn(move || {
                 let mut reader = reader;
-                let mut zip_file = match zip::read::read_zipfile_from_stream(&mut reader) {
-                    Ok(Some(file)) => file,
-                    Ok(None) => return,
-                    Err(e) => {
-                        let _ =
-                            tx.send(Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e)));
-                        return;
-                    }
-                };
-                let mut buffer = vec![0u8; 64 * 1024];
+                // Sequentially scan entries in the non-seekable stream, skipping directory
+                // headers and macOS metadata to find the real disk image payload.
                 loop {
-                    match zip_file.read(&mut buffer) {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            if tx.send(Ok(buffer[..n].to_vec())).is_err() {
-                                break;
+                    let mut zip_file = match zip::read::read_zipfile_from_stream(&mut reader) {
+                        Ok(Some(file)) => file,
+                        Ok(None) => return, // End of archive stream
+                        Err(e) => {
+                            let _ = tx
+                                .send(Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e)));
+                            return;
+                        }
+                    };
+
+                    let name = zip_file.name().to_ascii_lowercase();
+                    let is_dir = zip_file.is_dir() || name.ends_with('/');
+                    let is_macos_meta = name.contains("__macosx")
+                        || name.split('/').any(|seg| seg.starts_with("._"));
+
+                    if is_dir || is_macos_meta {
+                        // Dropping zip_file advances reader past entry payload
+                        continue;
+                    }
+
+                    let mut buffer = vec![0u8; 64 * 1024];
+                    loop {
+                        match zip_file.read(&mut buffer) {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                if tx.send(Ok(buffer[..n].to_vec())).is_err() {
+                                    return;
+                                }
+                            }
+                            Err(e) => {
+                                let _ = tx.send(Err(e));
+                                return;
                             }
                         }
-                        Err(e) => {
-                            let _ = tx.send(Err(e));
-                            break;
-                        }
                     }
+                    break;
                 }
             });
             Ok(Box::new(ChannelReader::new(rx, handle)))
@@ -195,7 +211,10 @@ pub fn open_seekable_decompressor<R: Read + Seek + Send + 'static>(
                 for i in 0..archive.len() {
                     if let Ok(file) = archive.by_index(i) {
                         let name = file.name().to_ascii_lowercase();
-                        if name.ends_with('/') || name.contains("__macosx") {
+                        if name.ends_with('/')
+                            || name.contains("__macosx")
+                            || name.split('/').any(|seg| seg.starts_with("._"))
+                        {
                             continue;
                         }
                         let is_image = name.ends_with(".img")
@@ -279,9 +298,11 @@ mod tests {
 
     #[test]
     fn test_zero_temporary_files_generated() {
-        let initial_temp_entries = std::fs::read_dir(std::env::temp_dir())
-            .map(|d| d.count())
-            .unwrap_or(0);
+        let initial_files: std::collections::HashSet<_> = std::fs::read_dir(std::env::temp_dir())
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok().map(|e| e.file_name()))
+            .collect();
 
         let source = b"Decompressing entirely in-memory with zero host temp files!";
         let mut reader = open_decompressor(&source[..], ImageFormat::Raw).expect("open failed");
@@ -289,11 +310,17 @@ mod tests {
         reader.read_to_end(&mut output).expect("read failed");
         assert_eq!(output, source);
 
-        let post_temp_entries = std::fs::read_dir(std::env::temp_dir())
-            .map(|d| d.count())
-            .unwrap_or(0);
+        let new_files: Vec<_> = std::fs::read_dir(std::env::temp_dir())
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok().map(|e| e.file_name()))
+            .filter(|f| !initial_files.contains(f))
+            .collect();
 
         // Verification: Zero temporary files created on host storage during streaming
-        assert_eq!(initial_temp_entries, post_temp_entries);
+        assert!(
+            new_files.is_empty(),
+            "Expected zero new temporary files in temp dir, found: {new_files:?}"
+        );
     }
 }
