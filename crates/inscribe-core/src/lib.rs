@@ -16,4 +16,4 @@ pub use image::{
 };
 pub use progress::{FlashPhase, FlashProgress};
 pub use target::{BlockTarget, MultiBlockTarget};
-pub use writer::AlignedBuffer;
+pub use writer::{AlignedBuffer, BlockDeviceWriter, WriterOptions};
