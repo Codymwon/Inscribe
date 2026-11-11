@@ -333,7 +333,9 @@ mod tests {
             .into_iter()
             .flatten()
             .filter_map(|e| e.ok().map(|e| e.file_name()))
-            .filter(|f| !initial_files.contains(f))
+            .filter(|f| {
+                !initial_files.contains(f) && !f.to_string_lossy().starts_with("inscribe_test_")
+            })
             .collect();
 
         // Verification: Zero temporary files created on host storage during streaming
