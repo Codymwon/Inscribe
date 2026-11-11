@@ -6,7 +6,7 @@ use crate::term::{
 };
 use inscribe_core::drive::{DriveGuard, DriveScanner};
 use inscribe_core::error::InscribeError;
-use inscribe_core::image::{detect_format, inspect_image, open_decompressor};
+use inscribe_core::image::{detect_format, inspect_image, open_seekable_decompressor};
 use inscribe_core::pipeline::{FlashPipeline, FlashSummary, PipelineOptions};
 use inscribe_core::privilege::PrivilegeManager;
 use inscribe_core::progress::FlashPhase;
@@ -122,13 +122,15 @@ pub fn run_flash<R: BufRead, W: Write>(
     file.seek(SeekFrom::Start(0))?;
 
     // 2. Drive Guard and Safety validation
-    if args.unsafe_allow_system_drives {
+    let target_snapshot = if args.unsafe_allow_system_drives {
         prompt_unsafe_override(stdin, stdout, &args.device)?;
+        None
     } else {
         // Enforce Drive Guard protection against system/internal disks
         let drives = scanner.scan_drives().unwrap_or_default();
         if let Some(target_drive) = drives.iter().find(|d| d.path == args.device) {
             DriveGuard::validate_target_with_options(target_drive, args.allow_usb_ssd)?;
+            Some(target_drive.clone())
         } else {
             // Target path not found in enumerated devices - fail closed unless unsafe override enabled
             return Err(InscribeError::drive_guard_violation(
@@ -139,7 +141,7 @@ pub fn run_flash<R: BufRead, W: Write>(
                 ),
             ));
         }
-    }
+    };
 
     // 3. Privilege warning/guidance
     let priv_mgr = PrivilegeManager::new();
@@ -170,13 +172,29 @@ pub fn run_flash<R: BufRead, W: Write>(
     }
 
     // 4. Open streaming decompressor (zero temporary host storage writes)
-    let reader = open_decompressor(file, metadata.format)?;
+    let reader = open_seekable_decompressor(file, metadata.format)?;
 
-    // 5. Open block device writer with O_DIRECT / FILE_FLAG_NO_BUFFERING
+    // 5. Live target attestation (prevent TOCTOU device swap races)
+    if let Some(snapshot) = &target_snapshot {
+        let live_drives = scanner.scan_drives().unwrap_or_default();
+        if let Some(live_drive) = live_drives.iter().find(|d| d.path == args.device) {
+            DriveGuard::attest_target(snapshot, live_drive, args.allow_usb_ssd)?;
+        } else {
+            return Err(InscribeError::drive_guard_violation(
+                &args.device,
+                format!(
+                    "Target device '{}' disappeared between initial scan and write attempt",
+                    args.device.display()
+                ),
+            ));
+        }
+    }
+
+    // 6. Open block device writer with O_DIRECT / FILE_FLAG_NO_BUFFERING
     let writer_options = WriterOptions::direct();
     let target = BlockDeviceWriter::open_path(&args.device, &writer_options)?;
 
-    // 6. Configure pipeline options
+    // 7. Configure pipeline options
     let options = PipelineOptions {
         expected_size: metadata.uncompressed_size,
         verify: !args.no_verify,

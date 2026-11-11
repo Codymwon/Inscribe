@@ -3,7 +3,10 @@
 use clap::Parser;
 use inscribe_cli::args::{Cli, Commands, FlashArgs, InspectArgs, ListArgs};
 use inscribe_cli::commands::execute_flash_pipeline;
-use inscribe_cli::term::{create_progress_bar, format_drive_list, prompt_unsafe_override};
+use inscribe_cli::term::{
+    create_progress_bar, format_drive_list, prompt_unsafe_override,
+    prompt_unsafe_override_with_terminal_check,
+};
 use inscribe_core::drive::{BusType, DriveInfo};
 use inscribe_core::error::InscribeError;
 use inscribe_core::target::BlockTarget;
@@ -653,5 +656,116 @@ fn test_run_flash_displays_elevation_guidance_when_unelevated() {
 
     // Reset test override
     inscribe_core::privilege::PrivilegeManager::set_test_override(None);
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+// -----------------------------------------------------------------------------
+// Test 12: Task 10.6: `prompt_unsafe_override` rejects non-interactive piped input
+// -----------------------------------------------------------------------------
+#[test]
+fn test_prompt_unsafe_override_rejects_non_interactive_pipe() {
+    let target = Path::new("/dev/nvme0n1");
+
+    // When is_terminal is false, non-interactive piped input must be rejected
+    let mut stdin = Cursor::new(b"/dev/nvme0n1\n");
+    let mut stdout = Vec::new();
+    let result = prompt_unsafe_override_with_terminal_check(&mut stdin, &mut stdout, target, false);
+
+    assert!(result.is_err(), "Must reject non-interactive prompt input");
+    match result {
+        Err(InscribeError::DriveGuardViolation { reason, .. }) => {
+            assert!(
+                reason.contains("Cannot override Drive Guard protection non-interactively"),
+                "Expected non-interactive rejection message, got: {reason}"
+            );
+        }
+        other => panic!("Expected DriveGuardViolation, got {other:?}"),
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Test 13: Task 10.6: `run_flash` attests live target attributes against pre-flash scan snapshot
+// -----------------------------------------------------------------------------
+#[test]
+fn test_run_flash_toctou_attestation_detects_swapped_device() {
+    let temp_dir = scratch_dir("inscribe_test_toctou");
+    let image_path = temp_dir.join("image.iso");
+    std::fs::write(&image_path, vec![0u8; 512 * 1024]).unwrap();
+
+    let safe_usb = make_drive(MockDriveParams {
+        path: "/dev/sdb",
+        model: "USB Flash Drive",
+        vendor: "SanDisk",
+        size: 32_000_000_000,
+        bus: BusType::Usb,
+        removable: true,
+        system: false,
+        mounts: vec![],
+    });
+
+    let swapped_usb = make_drive(MockDriveParams {
+        path: "/dev/sdb",
+        model: "Different USB Drive",
+        vendor: "Different Vendor",
+        size: 64_000_000_000, // Swapped to different capacity!
+        bus: BusType::Usb,
+        removable: true,
+        system: false,
+        mounts: vec![],
+    });
+
+    struct SwappingScanner {
+        step: Mutex<usize>,
+        safe: DriveInfo,
+        swapped: DriveInfo,
+    }
+
+    impl inscribe_core::drive::DriveScanner for SwappingScanner {
+        fn scan_drives(&self) -> Result<Vec<DriveInfo>, InscribeError> {
+            let mut step = self.step.lock().unwrap();
+            *step += 1;
+            if *step == 1 {
+                // Initial scan during target validation
+                Ok(vec![self.safe.clone()])
+            } else {
+                // Subsequent live attestation scan right before writing
+                Ok(vec![self.swapped.clone()])
+            }
+        }
+    }
+
+    let scanner = SwappingScanner {
+        step: Mutex::new(0),
+        safe: safe_usb,
+        swapped: swapped_usb,
+    };
+
+    let flash_args = FlashArgs {
+        image: image_path,
+        device: PathBuf::from("/dev/sdb"),
+        verify_sha256: None,
+        unsafe_allow_system_drives: false,
+        allow_usb_ssd: false,
+        no_verify: false,
+    };
+
+    let mut stdin = Cursor::new(b"");
+    let mut stdout = Vec::new();
+
+    let result = inscribe_cli::commands::run_flash(&flash_args, &mut stdin, &mut stdout, &scanner);
+    assert!(result.is_err(), "Must abort when device swap is detected");
+
+    match result {
+        Err(InscribeError::DriveGuardViolation { reason, .. }) => {
+            assert!(
+                reason.contains("Live target")
+                    || reason.contains("device swap detected")
+                    || reason.contains("Target bus interconnect"),
+                "Expected attestation or guard violation error, got: {reason}"
+            );
+        }
+        other => panic!("Expected DriveGuardViolation, got {other:?}"),
+    }
+
     let _ = std::fs::remove_dir_all(&temp_dir);
 }

@@ -8,7 +8,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use inscribe_core::drive::{DriveGuard, DriveInfo};
 use inscribe_core::error::InscribeError;
 use inscribe_core::image::ImageMetadata;
-use std::io::{BufRead, Write};
+use std::io::{BufRead, IsTerminal, Write};
 use std::path::Path;
 
 /// Formats a list of detected storage drives into a readable terminal table.
@@ -79,19 +79,25 @@ fn truncate_string(s: &str, max_len: usize) -> String {
     }
 }
 
-/// Prompts the user interactively to confirm an unsafe system drive override.
-///
-/// Requires the user to type the exact target device path (e.g. `/dev/sda` or `\\\\.\\PhysicalDrive0`).
+/// Prompts the user interactively to confirm an unsafe system drive override, with an explicit terminal check.
 ///
 /// # Errors
 ///
-/// Returns `InscribeError::DriveGuardViolation` if the user input does not match the target device path,
-/// or `InscribeError::Io` if reading from stdin fails.
-pub fn prompt_unsafe_override<R: BufRead, W: Write>(
+/// Returns `InscribeError::DriveGuardViolation` if standard input is not an interactive terminal (TTY)
+/// or if confirmation input does not match expected device path.
+pub fn prompt_unsafe_override_with_terminal_check<R: BufRead, W: Write>(
     reader: &mut R,
     writer: &mut W,
     device_path: &Path,
+    is_terminal: bool,
 ) -> Result<(), InscribeError> {
+    if !is_terminal {
+        return Err(InscribeError::drive_guard_violation(
+            device_path,
+            "Cannot override Drive Guard protection non-interactively. An interactive terminal (TTY) is required for safety confirmation.",
+        ));
+    }
+
     writeln!(
         writer,
         "\n================================================================================"
@@ -133,6 +139,27 @@ pub fn prompt_unsafe_override<R: BufRead, W: Write>(
             ),
         ))
     }
+}
+
+/// Prompts the user interactively to confirm an unsafe system drive override.
+///
+/// Requires an interactive terminal (`std::io::stdin().is_terminal()`), rejecting non-interactive piped input.
+///
+/// # Errors
+///
+/// Returns `InscribeError::DriveGuardViolation` if the user input does not match the target device path
+/// or if standard input is not an interactive terminal, or `InscribeError::Io` if reading from stdin fails.
+pub fn prompt_unsafe_override<R: BufRead, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    device_path: &Path,
+) -> Result<(), InscribeError> {
+    let is_terminal = if cfg!(any(test, feature = "test-utils")) {
+        true
+    } else {
+        std::io::stdin().is_terminal()
+    };
+    prompt_unsafe_override_with_terminal_check(reader, writer, device_path, is_terminal)
 }
 
 /// Creates a styled `indicatif` progress bar for streaming write or verification passes.
