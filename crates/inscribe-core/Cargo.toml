@@ -30,3 +30,10 @@ libc.workspace = true
 [dev-dependencies]
 tokio.workspace = true
 serde_json.workspace = true
+inscribe-core = { path = ".", features = ["test-utils"] }
+
+
+[features]
+default = []
+test-utils = []
+

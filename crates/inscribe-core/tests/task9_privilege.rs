@@ -237,3 +237,54 @@ fn test_require_elevation_error_reporting() {
         other => panic!("Expected PrivilegeRequired error, got: {other:?}"),
     }
 }
+
+#[test]
+fn test_macos_osascript_escapes_against_injection_and_string_breakout() {
+    // 1. Argument with double quotes, semicolon, and command injection payload
+    let malicious_arg = "test\"image;id;echo 'pwned'.iso";
+    let cmd =
+        ElevationCommand::macos_osascript("inscribe", &["flash", malicious_arg, "/dev/rdisk2"]);
+
+    assert_eq!(cmd.program, "osascript");
+    assert_eq!(cmd.args.len(), 2);
+    assert_eq!(cmd.args[0], "-e");
+
+    let script = &cmd.args[1];
+    // AppleScript command structure
+    assert!(script.starts_with("do shell script \""));
+    assert!(script.ends_with("\" with administrator privileges"));
+
+    // Inner string must escape double quotes so AppleScript string does not break out
+    assert!(script.contains(r#"test\"image"#));
+    // Inner command must quote arguments with single quotes in sh style: 'test"image;id;echo '\\''pwned'\\''.iso'
+    assert!(script.contains(r#"'test\"image;id;echo '\\''pwned'\\''.iso'"#));
+
+    // 2. Argument with backslashes and spaces
+    let tricky_arg = r#"path\with spaces/disk.iso"#;
+    let cmd2 = ElevationCommand::macos_osascript("inscribe", &["flash", tricky_arg]);
+    let script2 = &cmd2.args[1];
+    assert!(script2.contains(r#"path\\with spaces"#));
+}
+
+#[test]
+fn test_windows_uac_escapes_against_powershell_injection() {
+    // 1. Argument with single quotes attempting PowerShell breakout
+    let malicious_arg = "test'; Remove-Item C:\\ -Recurse -Force; '";
+    let cmd = ElevationCommand::windows_uac("inscribe.exe", &["flash", malicious_arg]);
+
+    assert_eq!(cmd.program, "powershell.exe");
+    let script = &cmd.args[2];
+
+    // Single quotes in PowerShell must be doubled to stay inside literal string
+    assert!(script.contains("test''; Remove-Item"));
+    // Argument list should use array syntax @(...)
+    assert!(
+        script.contains("-ArgumentList @('flash', 'test''; Remove-Item C:\\ -Recurse -Force; ''')")
+    );
+
+    // 2. Argument with PowerShell subexpression $(...)
+    let subexpr_arg = "$(Get-Process)";
+    let cmd2 = ElevationCommand::windows_uac("inscribe.exe", &[subexpr_arg]);
+    let script2 = &cmd2.args[2];
+    assert!(script2.contains("'$(Get-Process)'"));
+}

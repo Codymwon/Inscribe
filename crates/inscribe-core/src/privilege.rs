@@ -12,10 +12,12 @@ use crate::error::InscribeError;
 use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
+#[cfg(any(test, feature = "test-utils"))]
 use std::sync::atomic::{AtomicI8, Ordering};
 
 /// Static override for unit and integration testing without requiring root permissions.
 /// -1 = unconfigured (use live OS check), 0 = force unelevated (false), 1 = force elevated (true).
+#[cfg(any(test, feature = "test-utils"))]
 static TEST_OVERRIDE_ELEVATED: AtomicI8 = AtomicI8::new(-1);
 
 /// Strategy recommended by the validator when elevation or authorization is required.
@@ -92,16 +94,18 @@ impl ElevationCommand {
     /// Source: <https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.management/start-process>
     #[must_use]
     pub fn windows_uac(program: &str, args: &[&str]) -> Self {
-        let arg_list = args
-            .iter()
-            .map(|a| format!("'{a}'"))
-            .collect::<Vec<_>>()
-            .join(", ");
-
+        let safe_program = escape_powershell_single_quote(program);
         let ps_cmd = if args.is_empty() {
-            format!("Start-Process -FilePath '{program}' -Verb RunAs")
+            format!("Start-Process -FilePath '{safe_program}' -Verb RunAs")
         } else {
-            format!("Start-Process -FilePath '{program}' -ArgumentList {arg_list} -Verb RunAs")
+            let arg_list = args
+                .iter()
+                .map(|a| format!("'{}'", escape_powershell_single_quote(a)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "Start-Process -FilePath '{safe_program}' -ArgumentList @({arg_list}) -Verb RunAs"
+            )
         };
 
         Self {
@@ -115,13 +119,18 @@ impl ElevationCommand {
     /// Source: <https://developer.apple.com/library/archive/documentation/LanguagesUtilities/Conceptual/MacAutomationScriptingGuide/RunShellScripts.html>
     #[must_use]
     pub fn macos_osascript(program: &str, args: &[&str]) -> Self {
-        let target_cmd = if args.is_empty() {
-            program.to_string()
+        let escaped_program = escape_sh_arg(program);
+        let escaped_args: Vec<String> = args.iter().map(|a| escape_sh_arg(a)).collect();
+        let shell_cmd = if escaped_args.is_empty() {
+            escaped_program
         } else {
-            format!("{program} {}", args.join(" "))
+            format!("{escaped_program} {}", escaped_args.join(" "))
         };
 
-        let script = format!("do shell script \"{target_cmd}\" with administrator privileges");
+        let script = format!(
+            "do shell script \"{}\" with administrator privileges",
+            escape_applescript_literal(&shell_cmd)
+        );
         Self {
             program: "osascript".to_string(),
             args: vec!["-e".to_string(), script],
@@ -159,6 +168,21 @@ impl fmt::Display for ElevationCommand {
     }
 }
 
+/// Safely escapes an argument for POSIX shell syntax (`'...'` with internal `'` escaped as `'\''`).
+fn escape_sh_arg(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Safely escapes a string for inclusion in an AppleScript double-quoted string literal.
+fn escape_applescript_literal(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Safely escapes a string for PowerShell single-quoted literal syntax by doubling single quotes.
+fn escape_powershell_single_quote(s: &str) -> String {
+    s.replace('\'', "''")
+}
+
 /// Trait abstracting privilege queries for live systems and testing mocks.
 pub trait PrivilegeDetector: Send + Sync + fmt::Debug {
     /// Returns true if the process possesses administrative or root privileges.
@@ -171,29 +195,32 @@ pub struct OsPrivilegeDetector;
 
 impl PrivilegeDetector for OsPrivilegeDetector {
     fn is_elevated(&self) -> bool {
-        match TEST_OVERRIDE_ELEVATED.load(Ordering::SeqCst) {
-            0 => false,
-            1 => true,
-            _ => {
-                #[cfg(unix)]
-                {
-                    // POSIX geteuid(2): UID 0 indicates the superuser / root.
-                    // Source: <https://pubs.opengroup.org/onlinepubs/9699919799/functions/geteuid.html>
-                    unsafe { libc::geteuid() == 0 }
-                }
-
-                #[cfg(windows)]
-                {
-                    // On Windows, query process token elevation.
-                    // Source: <https://learn.microsoft.com/en-us/windows/win32/api/securitybaseapi/nf-securitybaseapi-gettokeninformation>
-                    windows_check_elevation()
-                }
-
-                #[cfg(not(any(unix, windows)))]
-                {
-                    false
-                }
+        #[cfg(any(test, feature = "test-utils"))]
+        {
+            match TEST_OVERRIDE_ELEVATED.load(Ordering::SeqCst) {
+                0 => return false,
+                1 => return true,
+                _ => {}
             }
+        }
+
+        #[cfg(unix)]
+        {
+            // POSIX geteuid(2): UID 0 indicates the superuser / root.
+            // Source: <https://pubs.opengroup.org/onlinepubs/9699919799/functions/geteuid.html>
+            unsafe { libc::geteuid() == 0 }
+        }
+
+        #[cfg(windows)]
+        {
+            // On Windows, query process token elevation.
+            // Source: <https://learn.microsoft.com/en-us/windows/win32/api/securitybaseapi/nf-securitybaseapi-gettokeninformation>
+            windows_check_elevation()
+        }
+
+        #[cfg(not(any(unix, windows)))]
+        {
+            false
         }
     }
 }
@@ -442,6 +469,7 @@ impl PrivilegeManager {
     ///
     /// Pass `Some(true)` to force elevated status, `Some(false)` to force unelevated status,
     /// or `None` to restore live OS detection.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn set_test_override(override_val: Option<bool>) {
         let val = match override_val {
             Some(false) => 0,
@@ -456,10 +484,17 @@ impl PrivilegeManager {
     /// Honors any active test override set via [`PrivilegeManager::set_test_override`].
     #[must_use]
     pub fn is_elevated() -> bool {
-        match TEST_OVERRIDE_ELEVATED.load(Ordering::SeqCst) {
-            0 => false,
-            1 => true,
-            _ => OsPrivilegeDetector.is_elevated(),
+        #[cfg(any(test, feature = "test-utils"))]
+        {
+            match TEST_OVERRIDE_ELEVATED.load(Ordering::SeqCst) {
+                0 => false,
+                1 => true,
+                _ => OsPrivilegeDetector.is_elevated(),
+            }
+        }
+        #[cfg(not(any(test, feature = "test-utils")))]
+        {
+            OsPrivilegeDetector.is_elevated()
         }
     }
 
