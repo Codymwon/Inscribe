@@ -326,3 +326,58 @@ fn test_drive_info_is_flashable_unifies_with_drive_guard() {
     assert!(!nvme.is_flashable(false));
     assert!(!nvme.is_flashable(true));
 }
+
+#[test]
+fn test_partition_targets_are_strictly_rejected() {
+    // Linux partition targeting
+    let part_sdb1 = create_base_drive("/dev/sdb1", BusType::Usb, true);
+    assert!(DriveGuard::validate_target(&part_sdb1).is_err());
+    let part_nvme = create_base_drive("/dev/nvme0n1p1", BusType::Usb, true);
+    assert!(DriveGuard::validate_target(&part_nvme).is_err());
+    let part_mmc = create_base_drive("/dev/mmcblk0p2", BusType::SdMmc, true);
+    assert!(DriveGuard::validate_target(&part_mmc).is_err());
+
+    // macOS partition targeting
+    let part_macos = create_base_drive("/dev/disk2s1", BusType::Usb, true);
+    assert!(DriveGuard::validate_target(&part_macos).is_err());
+    let part_macos_r = create_base_drive("/dev/rdisk3s2", BusType::Usb, true);
+    assert!(DriveGuard::validate_target(&part_macos_r).is_err());
+
+    // Windows volume / partition targeting
+    let vol_win = create_base_drive(r"\\.\E:", BusType::Usb, true);
+    assert!(DriveGuard::validate_target(&vol_win).is_err());
+    let vol_guid = create_base_drive(
+        r"\\?\Volume{12345678-1234-1234-1234-123456789abc}",
+        BusType::Usb,
+        true,
+    );
+    assert!(DriveGuard::validate_target(&vol_guid).is_err());
+}
+
+#[test]
+fn test_live_target_attestation_detects_swapped_device() {
+    let scan_drive = create_base_drive("/dev/sdb", BusType::Usb, true);
+    let mut live_drive = scan_drive.clone();
+
+    // Identical live drive passes attestation
+    assert!(DriveGuard::attest_target(&scan_drive, &live_drive, false).is_ok());
+
+    // Capacity swap (e.g. 32GB thumb drive replaced by 1TB SSD)
+    live_drive.size = 1_000_000_000_000;
+    assert!(DriveGuard::attest_target(&scan_drive, &live_drive, false).is_err());
+
+    // Reset and test bus interconnect swap (e.g. replaced by NVMe controller)
+    live_drive = scan_drive.clone();
+    live_drive.bus_type = BusType::Nvme;
+    assert!(DriveGuard::attest_target(&scan_drive, &live_drive, false).is_err());
+
+    // Reset and test newly mounted system volume on live target
+    live_drive = scan_drive.clone();
+    live_drive.mount_points = vec![PathBuf::from("/")];
+    assert!(DriveGuard::attest_target(&scan_drive, &live_drive, false).is_err());
+
+    // Removable status changed
+    live_drive = scan_drive.clone();
+    live_drive.is_removable = false;
+    assert!(DriveGuard::attest_target(&scan_drive, &live_drive, false).is_err());
+}

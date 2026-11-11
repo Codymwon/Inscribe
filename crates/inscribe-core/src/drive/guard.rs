@@ -115,6 +115,109 @@ impl DriveGuard {
             ));
         }
 
+        // Rule 7: Whole-disk target geometry assertion (reject individual partitions or volumes)
+        if is_partition_path(&drive.path) {
+            return Err(InscribeError::drive_guard_violation(
+                &drive.path,
+                "Target is a partition or volume, not a whole physical block device",
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Attests a live device against an earlier scanned snapshot to eliminate TOCTOU device swap races.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InscribeError::DriveGuardViolation` if the live device violates Drive Guard predicates,
+    /// or if its hardware attributes (bus type, capacity, sector size, removable flag, vendor, model)
+    /// differ from the snapshot.
+    pub fn attest_target(
+        snapshot: &DriveInfo,
+        live: &DriveInfo,
+        allow_external_usb_ssd: bool,
+    ) -> Result<(), InscribeError> {
+        // 1. Live target must independently pass all Drive Guard safety rules
+        Self::validate_target_with_options(live, allow_external_usb_ssd)?;
+
+        // 2. Paths must match
+        if snapshot.path != live.path {
+            return Err(InscribeError::drive_guard_violation(
+                &live.path,
+                format!(
+                    "Live target path mismatch: scan was {}, live is {}",
+                    snapshot.path.display(),
+                    live.path.display()
+                ),
+            ));
+        }
+
+        // 3. Bus interconnect must not have mutated
+        if snapshot.bus_type != live.bus_type {
+            return Err(InscribeError::drive_guard_violation(
+                &live.path,
+                format!(
+                    "Live target bus type mismatch (device swap detected): scan was {:?}, live is {:?}",
+                    snapshot.bus_type, live.bus_type
+                ),
+            ));
+        }
+
+        // 4. Capacity must match bit-for-bit
+        if snapshot.size != live.size {
+            return Err(InscribeError::drive_guard_violation(
+                &live.path,
+                format!(
+                    "Live target capacity mismatch (device swap detected): scan was {} bytes, live is {} bytes",
+                    snapshot.size, live.size
+                ),
+            ));
+        }
+
+        // 5. Removable media flag must match
+        if snapshot.is_removable != live.is_removable {
+            return Err(InscribeError::drive_guard_violation(
+                &live.path,
+                format!(
+                    "Live target removable status changed: scan was {}, live is {}",
+                    snapshot.is_removable, live.is_removable
+                ),
+            ));
+        }
+
+        // 6. Sector size must match
+        if snapshot.sector_size != live.sector_size {
+            return Err(InscribeError::drive_guard_violation(
+                &live.path,
+                format!(
+                    "Live target sector size mismatch: scan was {}, live is {}",
+                    snapshot.sector_size, live.sector_size
+                ),
+            ));
+        }
+
+        // 7. Vendor and model must match if populated
+        if !snapshot.vendor.is_empty() && !live.vendor.is_empty() && snapshot.vendor != live.vendor
+        {
+            return Err(InscribeError::drive_guard_violation(
+                &live.path,
+                format!(
+                    "Live target vendor mismatch: scan was '{}', live is '{}'",
+                    snapshot.vendor, live.vendor
+                ),
+            ));
+        }
+        if !snapshot.model.is_empty() && !live.model.is_empty() && snapshot.model != live.model {
+            return Err(InscribeError::drive_guard_violation(
+                &live.path,
+                format!(
+                    "Live target model mismatch: scan was '{}', live is '{}'",
+                    snapshot.model, live.model
+                ),
+            ));
+        }
+
         Ok(())
     }
 
@@ -202,6 +305,88 @@ pub fn is_system_mount(mount: &Path) -> bool {
     }
     if mount_trimmed == "/private" || mount_trimmed.starts_with("/private/") {
         return true;
+    }
+
+    // Active Linux / Unix swap space
+    if mount_trimmed == "[SWAP]" || mount_trimmed.eq_ignore_ascii_case("swap") {
+        return true;
+    }
+
+    false
+}
+
+/// Predicate checking if a device path represents a partition or volume rather than a whole block device.
+#[must_use]
+pub fn is_partition_path(path: &Path) -> bool {
+    let path_str = path.to_string_lossy();
+    let trimmed = path_str.trim();
+
+    // Windows checks:
+    // Volume GUIDs: \\?\Volume{...} or \\.\Volume{...}
+    if trimmed.starts_with(r"\\?\Volume{") || trimmed.starts_with(r"\\.\Volume{") {
+        return true;
+    }
+    // Drive letters: E:, \\.\E:, C:\, etc.
+    let upper = trimmed.to_ascii_uppercase();
+    if (upper.len() >= 2
+        && upper.chars().nth(1) == Some(':')
+        && upper
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic()))
+        || (upper.starts_with(r"\\.\")
+            && upper.len() >= 6
+            && upper.chars().nth(5) == Some(':')
+            && upper
+                .chars()
+                .nth(4)
+                .is_some_and(|c| c.is_ascii_alphabetic()))
+    {
+        return true;
+    }
+
+    // macOS checks:
+    // /dev/disk2s1 or /dev/rdisk2s1
+    let file_name = path.file_name().and_then(|f| f.to_str()).unwrap_or("");
+    if (file_name.starts_with("disk") || file_name.starts_with("rdisk")) && file_name.contains('s')
+    {
+        let base = file_name
+            .strip_prefix("rdisk")
+            .unwrap_or_else(|| file_name.strip_prefix("disk").unwrap_or(""));
+        if let Some((_disk_idx, part_idx)) = base.split_once('s') {
+            if !part_idx.is_empty() && part_idx.chars().all(|c| c.is_ascii_digit()) {
+                return true;
+            }
+        }
+    }
+
+    // Linux checks:
+    // /dev/sdb1, /dev/hda2, /dev/vda1, /dev/nvme0n1p1, /dev/mmcblk0p1, /dev/loop0p1
+    if trimmed.starts_with("/dev/") {
+        let dev = trimmed.strip_prefix("/dev/").unwrap_or("");
+        // SCSI/SATA/USB (sd), IDE (hd), VirtIO (vd), Xen (xvd)
+        for prefix in &["sd", "hd", "vd", "xvd"] {
+            if let Some(rest) = dev.strip_prefix(prefix) {
+                let letters_end = rest.find(|c: char| c.is_ascii_digit());
+                if let Some(pos) = letters_end {
+                    if pos > 0 && rest[pos..].chars().all(|c| c.is_ascii_digit()) {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        // NVMe / MMC / Loop with 'p' separator: e.g. nvme0n1p1, mmcblk0p1
+        if let Some(pos) = dev.rfind('p') {
+            let (prefix, suffix) = dev.split_at(pos);
+            let part_num = &suffix[1..];
+            if !part_num.is_empty()
+                && part_num.chars().all(|c| c.is_ascii_digit())
+                && prefix.chars().last().is_some_and(|c| c.is_ascii_digit())
+            {
+                return true;
+            }
+        }
     }
 
     false
