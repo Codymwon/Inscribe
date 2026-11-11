@@ -9,6 +9,6 @@ pub mod target;
 // Re-exports for convenient top-level access
 pub use drive::{BusType, DriveGuard, DriveInfo, DriveScanner, MockDriveScanner};
 pub use error::InscribeError;
-pub use image::{ImageFormat, ImageMetadata};
+pub use image::{ImageFormat, ImageMetadata, detect_format, detect_from_path, inspect_image};
 pub use progress::{FlashPhase, FlashProgress};
 pub use target::{BlockTarget, MultiBlockTarget};

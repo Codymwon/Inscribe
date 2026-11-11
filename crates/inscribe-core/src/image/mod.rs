@@ -1,7 +1,11 @@
-//! Disk image metadata and compression format definitions.
+//! Disk image metadata, compression format definitions, magic-byte detection, and streaming decompression.
+
+pub mod detector;
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+
+pub use detector::{detect_format, detect_from_path, inspect_image};
 
 /// Supported disk image archive and container formats.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,5 +90,39 @@ impl ImageMetadata {
     #[must_use]
     pub fn payload_size(&self) -> Option<u64> {
         Some(self.uncompressed_size.unwrap_or(self.file_size))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_properties() {
+        assert!(!ImageFormat::Raw.is_compressed());
+        assert!(!ImageFormat::Unknown.is_compressed());
+        assert!(ImageFormat::Gz.is_compressed());
+        assert!(ImageFormat::Xz.is_compressed());
+        assert!(ImageFormat::Zstd.is_compressed());
+        assert!(ImageFormat::Bzip2.is_compressed());
+        assert!(ImageFormat::Zip.is_compressed());
+
+        assert_eq!(ImageFormat::Raw.extension_str(), "iso");
+        assert_eq!(ImageFormat::Gz.extension_str(), "gz");
+        assert_eq!(ImageFormat::Xz.extension_str(), "xz");
+        assert_eq!(ImageFormat::Zstd.extension_str(), "zst");
+        assert_eq!(ImageFormat::Bzip2.extension_str(), "bz2");
+        assert_eq!(ImageFormat::Zip.extension_str(), "zip");
+    }
+
+    #[test]
+    fn test_metadata_payload_size() {
+        let meta = ImageMetadata::new(None, 1000, Some(2500), ImageFormat::Gz);
+        assert!(meta.has_deterministic_size());
+        assert_eq!(meta.payload_size(), Some(2500));
+
+        let meta_indeterminate = ImageMetadata::new(None, 1000, None, ImageFormat::Bzip2);
+        assert!(!meta_indeterminate.has_deterministic_size());
+        assert_eq!(meta_indeterminate.payload_size(), Some(1000));
     }
 }
