@@ -500,13 +500,7 @@ impl WindowsVolumeLockSequence {
     ///
     /// Returns `InscribeError::DriveGuardViolation` if target is system/internal,
     /// or `InscribeError::DeviceLockFailed` on failure.
-    pub fn execute_lock_sequence(
-        &self,
-        drive: &DriveInfo,
-    ) -> Result<WindowsVolumeLock, InscribeError> {
-        // Enforce Drive Guard safety checks
-        DriveGuard::validate_target(drive)?;
-
+    fn build_lock_steps(drive: &DriveInfo) -> (Vec<PathBuf>, Vec<VolumeLockStep>) {
         let mut executed_steps = Vec::new();
         let mut volume_paths = Vec::new();
 
@@ -540,6 +534,70 @@ impl WindowsVolumeLockSequence {
 
         // 4. Delete drive layout to clear partition handles and prevent Win11 Error 5
         executed_steps.push(VolumeLockStep::DeleteDriveLayout(drive.path.clone()));
+
+        (volume_paths, executed_steps)
+    }
+
+    /// Executes the full exclusive volume lock sequence on a target drive using default options.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InscribeError::DriveGuardViolation` if target is system/internal,
+    /// or `InscribeError::DeviceLockFailed` on failure.
+    pub fn execute_lock_sequence(
+        &self,
+        drive: &DriveInfo,
+    ) -> Result<WindowsVolumeLock, InscribeError> {
+        self.execute_lock_sequence_with_options(drive, false)
+    }
+
+    /// Executes the volume lock sequence with configurable Drive Guard opt-in options.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InscribeError::DriveGuardViolation` if target is system/internal,
+    /// or `InscribeError::DeviceLockFailed` on failure.
+    pub fn execute_lock_sequence_with_options(
+        &self,
+        drive: &DriveInfo,
+        allow_external_usb_ssd: bool,
+    ) -> Result<WindowsVolumeLock, InscribeError> {
+        // Enforce Drive Guard safety checks
+        DriveGuard::validate_target_with_options(drive, allow_external_usb_ssd)?;
+
+        let (volume_paths, executed_steps) = Self::build_lock_steps(drive);
+
+        Ok(WindowsVolumeLock {
+            drive_path: drive.path.clone(),
+            volume_paths,
+            executed_steps,
+            is_locked: true,
+        })
+    }
+
+    /// Executes the volume lock sequence via the provided `VolumeLockExecutor`.
+    ///
+    /// Iterates through every lock and dismount step, invoking `executor.execute_step(&step)`
+    /// and failing immediately if any step fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InscribeError::DriveGuardViolation` if rejected by Drive Guard,
+    /// or `InscribeError` if any executor step fails.
+    pub fn execute_sequence_with_executor(
+        &self,
+        drive: &DriveInfo,
+        executor: &mut dyn VolumeLockExecutor,
+        allow_external_usb_ssd: bool,
+    ) -> Result<WindowsVolumeLock, InscribeError> {
+        // Enforce Drive Guard safety checks
+        DriveGuard::validate_target_with_options(drive, allow_external_usb_ssd)?;
+
+        let (volume_paths, executed_steps) = Self::build_lock_steps(drive);
+
+        for step in &executed_steps {
+            executor.execute_step(step)?;
+        }
 
         Ok(WindowsVolumeLock {
             drive_path: drive.path.clone(),

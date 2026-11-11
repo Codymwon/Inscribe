@@ -114,9 +114,12 @@ impl MacDiskClaim {
     ///
     /// Returns `InscribeError::DriveGuardViolation` if the target is an internal or system disk,
     /// or `InscribeError::DeviceLockFailed` if DiskArbitration fails.
-    pub fn claim_and_unmount(drive: &DriveInfo) -> Result<Self, InscribeError> {
+    pub fn claim_and_unmount(
+        drive: &DriveInfo,
+        allow_external_usb_ssd: bool,
+    ) -> Result<Self, InscribeError> {
         // Enforce Drive Guard safety checks
-        DriveGuard::validate_target(drive)?;
+        DriveGuard::validate_target_with_options(drive, allow_external_usb_ssd)?;
 
         let bsd = bsd_name(&drive.path);
         let raw_path = to_raw_character_device(&drive.path);

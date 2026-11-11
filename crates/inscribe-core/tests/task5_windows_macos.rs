@@ -11,6 +11,7 @@ use inscribe_core::drive::windows::{
     WindowsVolumeLockSequence, parse_physical_drive_index, physical_drive_path, volume_path,
 };
 use inscribe_core::drive::{BusType, DriveInfo};
+use inscribe_core::error::InscribeError;
 use std::path::{Path, PathBuf};
 
 #[test]
@@ -283,7 +284,7 @@ fn test_macos_claim_sequence_and_drive_guard_rejection() {
         mount_points: vec![PathBuf::from("/System/Volumes/Data")],
     };
 
-    let res = MacDiskClaim::claim_and_unmount(&sys_drive);
+    let res = MacDiskClaim::claim_and_unmount(&sys_drive, false);
     assert!(
         res.is_err(),
         "Drive Guard must reject claiming macOS system disk"
@@ -302,10 +303,35 @@ fn test_macos_claim_sequence_and_drive_guard_rejection() {
         mount_points: vec![PathBuf::from("/Volumes/USB_STICK")],
     };
 
-    let claim = MacDiskClaim::claim_and_unmount(&usb_drive)
+    let claim = MacDiskClaim::claim_and_unmount(&usb_drive, false)
         .expect("Valid USB drive must claim successfully");
     assert_eq!(claim.raw_device_path(), Path::new("/dev/rdisk3"));
     assert_eq!(claim.bsd_name(), "disk3");
+}
+
+#[test]
+fn test_macos_claim_and_unmount_external_usb_ssd_opt_in() {
+    let usb_ssd = DriveInfo {
+        path: PathBuf::from("/dev/disk4"),
+        model: "Extreme Pro SSD".to_string(),
+        vendor: "SanDisk".to_string(),
+        size: 1_000_000_000_000,
+        sector_size: 4096,
+        bus_type: BusType::Usb,
+        is_removable: false,
+        is_read_only: false,
+        is_system: false,
+        mount_points: vec![PathBuf::from("/Volumes/Extreme")],
+    };
+
+    // Blocked without opt-in
+    assert!(MacDiskClaim::claim_and_unmount(&usb_ssd, false).is_err());
+
+    // Allowed with opt-in
+    let claim = MacDiskClaim::claim_and_unmount(&usb_ssd, true)
+        .expect("External USB SSD must claim successfully with opt-in");
+    assert_eq!(claim.raw_device_path(), Path::new("/dev/rdisk4"));
+    assert_eq!(claim.bsd_name(), "disk4");
 }
 
 #[test]
@@ -318,4 +344,97 @@ fn test_windows_mock_lock_executor() {
     executor
         .unlock_volume(Path::new(r"\\.\PhysicalDrive5"))
         .expect("Must unlock");
+}
+
+#[test]
+fn test_windows_volume_lock_sequence_with_executor_and_opt_in() {
+    let lock_seq = WindowsVolumeLockSequence::new();
+
+    let usb_ssd = DriveInfo {
+        path: PathBuf::from(r"\\.\PhysicalDrive3"),
+        model: "T7 Shield".to_string(),
+        vendor: "Samsung".to_string(),
+        size: 1_000_000_000_000,
+        sector_size: 512,
+        bus_type: BusType::Usb,
+        is_removable: false,
+        is_read_only: false,
+        is_system: false,
+        mount_points: vec![PathBuf::from(r"G:\")],
+    };
+
+    // Rejected by default
+    assert!(lock_seq.execute_lock_sequence(&usb_ssd).is_err());
+    assert!(
+        lock_seq
+            .execute_lock_sequence_with_options(&usb_ssd, false)
+            .is_err()
+    );
+
+    // Accepted with options
+    let lock = lock_seq
+        .execute_lock_sequence_with_options(&usb_ssd, true)
+        .expect("USB SSD lock sequence must succeed with opt-in");
+    assert_eq!(lock.executed_steps().len(), 5);
+
+    // Wire and execute with VolumeLockExecutor
+    let mut mock_executor = MockLockExecutor::new();
+    let executed_lock = lock_seq
+        .execute_sequence_with_executor(&usb_ssd, &mut mock_executor, true)
+        .expect("Must execute sequence with executor");
+
+    assert_eq!(mock_executor.steps().len(), 5);
+    assert_eq!(executed_lock.executed_steps(), mock_executor.steps());
+    assert_eq!(
+        mock_executor.steps(),
+        &[
+            VolumeLockStep::LockVolume(PathBuf::from(r"\\.\G:")),
+            VolumeLockStep::DismountVolume(PathBuf::from(r"\\.\G:")),
+            VolumeLockStep::LockPhysicalDrive(PathBuf::from(r"\\.\PhysicalDrive3")),
+            VolumeLockStep::DismountPhysicalDrive(PathBuf::from(r"\\.\PhysicalDrive3")),
+            VolumeLockStep::DeleteDriveLayout(PathBuf::from(r"\\.\PhysicalDrive3")),
+        ]
+    );
+}
+
+struct FailingLockExecutor;
+
+impl inscribe_core::drive::windows::VolumeLockExecutor for FailingLockExecutor {
+    fn execute_step(&mut self, _step: &VolumeLockStep) -> Result<(), InscribeError> {
+        Err(InscribeError::DeviceLockFailed {
+            path: r"\\.\G:".to_string(),
+            reason: "Simulated lock collision Win11 Error 5".to_string(),
+        })
+    }
+
+    fn unlock_volume(&mut self, _target: &Path) -> Result<(), InscribeError> {
+        Ok(())
+    }
+}
+
+#[test]
+fn test_windows_volume_lock_sequence_executor_error_propagation() {
+    let lock_seq = WindowsVolumeLockSequence::new();
+    let drive = DriveInfo {
+        path: PathBuf::from(r"\\.\PhysicalDrive3"),
+        model: "USB".to_string(),
+        vendor: "Test".to_string(),
+        size: 32_000_000_000,
+        sector_size: 512,
+        bus_type: BusType::Usb,
+        is_removable: true,
+        is_read_only: false,
+        is_system: false,
+        mount_points: vec![PathBuf::from(r"G:\")],
+    };
+
+    let mut failing_executor = FailingLockExecutor;
+    let res = lock_seq.execute_sequence_with_executor(&drive, &mut failing_executor, false);
+    assert!(res.is_err(), "Executor errors must halt lock sequence");
+    match res.unwrap_err() {
+        InscribeError::DeviceLockFailed { reason, .. } => {
+            assert!(reason.contains("Simulated lock collision"));
+        }
+        other => panic!("Expected DeviceLockFailed, got {other:?}"),
+    }
 }
