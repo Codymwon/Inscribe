@@ -8,6 +8,23 @@ use crate::writer::aligned::AlignedBuffer;
 use std::fs::File;
 use std::path::Path;
 
+/// macOS disk ioctl request code to query logical block size in bytes.
+/// Defined in `<sys/disk.h>`: `_IOR('d', 24, uint32_t)`
+pub const MACOS_DKIOCGETBLOCKSIZE: u64 = 0x4004_6418;
+
+/// macOS disk ioctl request code to query total block count.
+/// Defined in `<sys/disk.h>`: `_IOR('d', 25, uint64_t)`
+pub const MACOS_DKIOCGETBLOCKCOUNT: u64 = 0x4008_6419;
+
+/// Computes block device capacity in bytes from sector block size and count with overflow safety.
+#[must_use]
+pub fn compute_macos_block_capacity(block_size: u32, block_count: u64) -> Option<u64> {
+    if block_size == 0 || block_count == 0 {
+        return None;
+    }
+    block_count.checked_mul(block_size as u64)
+}
+
 /// Configuration options for `BlockDeviceWriter`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WriterOptions {
@@ -228,6 +245,25 @@ impl BlockTarget for BlockDeviceWriter {
                 unsafe { libc::ioctl(self.file.as_raw_fd(), BLKGETSIZE64 as _, &mut dev_size) };
             if ret == 0 && dev_size > 0 {
                 return Ok(dev_size);
+            }
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = self.file.as_raw_fd();
+            let mut block_size: u32 = 0;
+            let mut block_count: u64 = 0;
+
+            let size_ret =
+                unsafe { libc::ioctl(fd, MACOS_DKIOCGETBLOCKSIZE as _, &mut block_size) };
+            let count_ret =
+                unsafe { libc::ioctl(fd, MACOS_DKIOCGETBLOCKCOUNT as _, &mut block_count) };
+
+            if size_ret == 0 && count_ret == 0 {
+                if let Some(total) = compute_macos_block_capacity(block_size, block_count) {
+                    return Ok(total);
+                }
             }
         }
 

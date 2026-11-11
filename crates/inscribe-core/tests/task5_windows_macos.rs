@@ -613,3 +613,38 @@ fn test_macos_claim_sequence_attestation_detects_swapped_device() {
         "Live attestation must reject macOS claim when device capacity swapped"
     );
 }
+
+#[test]
+fn test_macos_character_device_capacity_ioctls() {
+    use inscribe_core::writer::direct::{
+        MACOS_DKIOCGETBLOCKCOUNT, MACOS_DKIOCGETBLOCKSIZE, compute_macos_block_capacity,
+    };
+
+    // Verify Darwin / macOS ioctl macro calculations from <sys/disk.h>
+    // DKIOCGETBLOCKSIZE = _IOR('d', 24, uint32_t) -> 0x40046418
+    assert_eq!(
+        MACOS_DKIOCGETBLOCKSIZE, 0x4004_6418,
+        "DKIOCGETBLOCKSIZE must match _IOR('d', 24, uint32_t)"
+    );
+
+    // DKIOCGETBLOCKCOUNT = _IOR('d', 25, uint64_t) -> 0x40086419
+    assert_eq!(
+        MACOS_DKIOCGETBLOCKCOUNT, 0x4008_6419,
+        "DKIOCGETBLOCKCOUNT must match _IOR('d', 25, uint64_t)"
+    );
+
+    // 32GB flash drive with 512B sectors (62,500,000 blocks)
+    let size_32gb = compute_macos_block_capacity(512, 62_500_000);
+    assert_eq!(size_32gb, Some(32_000_000_000));
+
+    // 1TB NVMe / USB SSD with 4096B sectors (244,140,625 blocks)
+    let size_1tb = compute_macos_block_capacity(4096, 244_140_625);
+    assert_eq!(size_1tb, Some(1_000_000_000_000));
+
+    // Zero block size or block count returns None
+    assert_eq!(compute_macos_block_capacity(0, 100), None);
+    assert_eq!(compute_macos_block_capacity(512, 0), None);
+
+    // Overflow protection
+    assert_eq!(compute_macos_block_capacity(4096, u64::MAX), None);
+}
