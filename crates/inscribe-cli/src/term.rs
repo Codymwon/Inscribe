@@ -36,12 +36,10 @@ pub fn format_drive_list(drives: &[DriveInfo], show_all: bool, allow_usb_ssd: bo
 
     for drive in filtered {
         let path = drive.path.to_string_lossy();
-        let model_vendor = if drive.vendor.is_empty() {
-            drive.model.clone()
-        } else if drive.model.is_empty() {
-            drive.vendor.clone()
-        } else {
-            format!("{} {}", drive.vendor, drive.model)
+        let model_vendor = match (drive.vendor.is_empty(), drive.model.is_empty()) {
+            (true, _) => drive.model.clone(),
+            (_, true) => drive.vendor.clone(),
+            (false, false) => format!("{} {}", drive.vendor, drive.model),
         };
 
         let size_str = drive.formatted_size();
@@ -154,11 +152,7 @@ pub fn prompt_unsafe_override<R: BufRead, W: Write>(
     writer: &mut W,
     device_path: &Path,
 ) -> Result<(), InscribeError> {
-    let is_terminal = if cfg!(any(test, feature = "test-utils")) {
-        true
-    } else {
-        std::io::stdin().is_terminal()
-    };
+    let is_terminal = cfg!(any(test, feature = "test-utils")) || std::io::stdin().is_terminal();
     prompt_unsafe_override_with_terminal_check(reader, writer, device_path, is_terminal)
 }
 

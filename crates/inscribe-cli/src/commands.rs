@@ -9,7 +9,6 @@ use inscribe_core::error::InscribeError;
 use inscribe_core::image::{detect_format, inspect_image, open_seekable_decompressor};
 use inscribe_core::pipeline::{FlashPipeline, FlashSummary, PipelineOptions};
 use inscribe_core::privilege::PrivilegeManager;
-use inscribe_core::progress::FlashPhase;
 use inscribe_core::target::BlockTarget;
 use inscribe_core::writer::{BlockDeviceWriter, WriterOptions};
 use std::fs::File;
@@ -32,14 +31,23 @@ pub fn run_list(args: &ListArgs, scanner: &dyn DriveScanner) -> Result<String, I
 /// Returns `InscribeError::Io` if image file cannot be opened,
 /// or `InscribeError` if inspection fails.
 pub fn run_inspect(args: &InspectArgs) -> Result<String, InscribeError> {
-    let mut file = File::open(&args.image)?;
+    let (_file, metadata) = inspect_image_file(&args.image)?;
+    Ok(format_inspection(&metadata))
+}
+
+/// Helper to inspect an image file and rewind it ready for streaming.
+fn inspect_image_file(
+    path: &std::path::Path,
+) -> Result<(File, inscribe_core::image::ImageMetadata), InscribeError> {
+    let mut file = File::open(path)?;
     let mut header = [0u8; 4096];
     let n = file.read(&mut header)?;
-    let format = detect_format(&header[..n], Some(&args.image));
+    let format = detect_format(&header[..n], Some(path));
     file.seek(SeekFrom::Start(0))?;
 
-    let metadata = inspect_image(&mut file, format, Some(&args.image))?;
-    Ok(format_inspection(&metadata))
+    let metadata = inspect_image(&mut file, format, Some(path))?;
+    file.seek(SeekFrom::Start(0))?;
+    Ok((file, metadata))
 }
 
 /// Executes the flash pipeline with an explicit reader and target.
@@ -61,25 +69,13 @@ pub fn execute_flash_pipeline<R: Read + Send + 'static, T: BlockTarget + 'static
 
     while let Ok(progress) = handle.progress_rx.recv() {
         pb.set_position(progress.bytes_processed);
-        let phase_str = match progress.phase {
-            FlashPhase::Initializing => "Initializing",
-            FlashPhase::Flashing => "Flashing",
-            FlashPhase::Verifying => "Verifying",
-            FlashPhase::Completed => "Completed",
-            FlashPhase::Failed => "Failed",
-            FlashPhase::Cancelled => "Cancelled",
-        };
+        let phase = progress.phase;
+        let speed = progress.speed_mb_per_sec();
 
         if let Some(eta) = progress.eta_seconds {
-            pb.set_message(format!(
-                "[{phase_str}] {:.1} MB/s (ETA: {eta}s)",
-                progress.speed_mb_per_sec()
-            ));
+            pb.set_message(format!("[{phase:?}] {speed:.1} MB/s (ETA: {eta}s)"));
         } else {
-            pb.set_message(format!(
-                "[{phase_str}] {:.1} MB/s",
-                progress.speed_mb_per_sec()
-            ));
+            pb.set_message(format!("[{phase:?}] {speed:.1} MB/s"));
         }
     }
 
@@ -112,14 +108,7 @@ pub fn run_flash<R: BufRead, W: Write>(
     scanner: &dyn DriveScanner,
 ) -> Result<FlashSummary, InscribeError> {
     // 1. Inspect image
-    let mut file = File::open(&args.image)?;
-    let mut header = [0u8; 4096];
-    let n = file.read(&mut header)?;
-    let format = detect_format(&header[..n], Some(&args.image));
-    file.seek(SeekFrom::Start(0))?;
-
-    let metadata = inspect_image(&mut file, format, Some(&args.image))?;
-    file.seek(SeekFrom::Start(0))?;
+    let (file, metadata) = inspect_image_file(&args.image)?;
 
     // 2. Drive Guard and Safety validation
     let target_snapshot = if args.unsafe_allow_system_drives {
@@ -147,27 +136,20 @@ pub fn run_flash<R: BufRead, W: Write>(
     let priv_mgr = PrivilegeManager::new();
     if !priv_mgr.check_elevated() {
         let args_vec: Vec<String> = std::env::args().collect();
-        let str_refs: Vec<&str> = args_vec.iter().map(String::as_str).collect();
-        let program = args_vec.first().map(String::as_str).unwrap_or("inscribe");
-        let rest_args = if args_vec.len() > 1 {
-            &str_refs[1..]
-        } else {
-            &[]
-        };
+        let program = args_vec.first().map_or("inscribe", |s| s.as_str());
+        let rest_args: Vec<&str> = args_vec.iter().skip(1).map(String::as_str).collect();
 
-        let cmd_str = priv_mgr
-            .generate_elevation_command(program, rest_args)
-            .map(|c| c.to_shell_string())
+        let cmd = priv_mgr
+            .generate_elevation_command(program, &rest_args)
             .unwrap_or_else(|| {
-                inscribe_core::privilege::ElevationCommand::sudo(program, rest_args)
-                    .to_shell_string()
+                inscribe_core::privilege::ElevationCommand::sudo(program, &rest_args)
             });
 
         writeln!(
             stdout,
             "Note: Elevated permissions may be required to write directly to block devices."
         )?;
-        writeln!(stdout, "Recommended command: {cmd_str}")?;
+        writeln!(stdout, "Recommended command: {cmd}")?;
         stdout.flush()?;
     }
 
