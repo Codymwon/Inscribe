@@ -355,3 +355,111 @@ fn test_streaming_zip_skips_directories_and_macos_metadata() {
     );
 }
 
+
+// Mock seekable reader to simulate large Gzip files (> 4 GiB) without allocating host disk/RAM
+struct MockGzipStream {
+    file_size: u64,
+    cursor_pos: u64,
+    header: [u8; 10],
+    isize_footer: [u8; 4],
+}
+
+impl MockGzipStream {
+    fn new(file_size: u64, reported_isize: u32) -> Self {
+        Self {
+            file_size,
+            cursor_pos: 0,
+            header: [0x1F, 0x8B, 0x08, 0x00, 0, 0, 0, 0, 0, 0xFF],
+            isize_footer: reported_isize.to_le_bytes(),
+        }
+    }
+}
+
+impl Read for MockGzipStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.cursor_pos >= self.file_size {
+            return Ok(0);
+        }
+
+        let mut bytes_read = 0;
+        for byte in buf.iter_mut() {
+            if self.cursor_pos >= self.file_size {
+                break;
+            }
+            if self.cursor_pos < 10 {
+                *byte = self.header[self.cursor_pos as usize];
+            } else if self.cursor_pos >= self.file_size - 4 {
+                let footer_idx = (self.cursor_pos - (self.file_size - 4)) as usize;
+                *byte = self.isize_footer[footer_idx];
+            } else {
+                *byte = 0x55; // Dummy compressed payload byte
+            }
+            self.cursor_pos += 1;
+            bytes_read += 1;
+        }
+
+        Ok(bytes_read)
+    }
+}
+
+impl std::io::Seek for MockGzipStream {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        match pos {
+            std::io::SeekFrom::Start(p) => {
+                self.cursor_pos = p.min(self.file_size);
+            }
+            std::io::SeekFrom::End(p) => {
+                let target = (self.file_size as i64) + p;
+                self.cursor_pos = target.max(0) as u64;
+            }
+            std::io::SeekFrom::Current(p) => {
+                let target = (self.cursor_pos as i64) + p;
+                self.cursor_pos = target.max(0) as u64;
+            }
+        }
+        Ok(self.cursor_pos)
+    }
+}
+
+#[test]
+fn test_inspect_gzip_greater_than_4gib_falls_back_to_indeterminate() {
+    const FOUR_GIB: u64 = 4 * 1024 * 1024 * 1024;
+
+    // Case 1: Compressed file is >= 4 GiB (4.5 GiB)
+    // RFC 1952 32-bit ISIZE modulo wraps -> must fall back to None
+    let mut large_gz = MockGzipStream::new(FOUR_GIB + 500 * 1024 * 1024, 1_000_000_000);
+    let meta = inspect_image(&mut large_gz, ImageFormat::Gz, Some(Path::new("large.gz")))
+        .expect("inspect failed");
+    assert_eq!(
+        meta.uncompressed_size, None,
+        "Gzip file >= 4 GiB must return None for uncompressed size (indeterminate)"
+    );
+
+    // Case 2: Compressed file is 2 GiB, but ISIZE reports 500 MB (isize < file_size)
+    // Suggests modulo 2^32 wrap -> must fall back to None
+    let mut wrapped_gz = MockGzipStream::new(2 * 1024 * 1024 * 1024, 500 * 1024 * 1024);
+    let meta_wrapped = inspect_image(
+        &mut wrapped_gz,
+        ImageFormat::Gz,
+        Some(Path::new("wrapped.gz")),
+    )
+    .expect("inspect failed");
+    assert_eq!(
+        meta_wrapped.uncompressed_size, None,
+        "Gzip file with ISIZE < file_size must return None (modulo wrap)"
+    );
+
+    // Case 3: Normal Gzip file (500 MB compressed, 1.2 GB uncompressed)
+    let mut normal_gz = MockGzipStream::new(500 * 1024 * 1024, 1_200_000_000);
+    let meta_normal = inspect_image(
+        &mut normal_gz,
+        ImageFormat::Gz,
+        Some(Path::new("normal.gz")),
+    )
+    .expect("inspect failed");
+    assert_eq!(
+        meta_normal.uncompressed_size,
+        Some(1_200_000_000),
+        "Normal Gzip under 4 GiB must return Some(isize)"
+    );
+}

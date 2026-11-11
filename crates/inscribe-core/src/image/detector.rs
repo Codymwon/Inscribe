@@ -130,12 +130,26 @@ pub fn inspect_image<R: Read + Seek>(
             size
         }
         ImageFormat::Gz => {
-            // RFC 1952 Gzip footer ISIZE hint (last 4 bytes, little-endian u32)
+            // RFC 1952 Gzip footer ISIZE hint (last 4 bytes, little-endian u32).
+            // Source: https://www.rfc-editor.org/rfc/rfc1952#page-5
+            // ISIZE is modulo 2^32 (4 GiB). If compressed file size >= 4 GiB or
+            // the reported ISIZE is less than compressed file size, the uncompressed
+            // size has wrapped modulo 2^32 or is indeterminate. Fall back to None.
+            const FOUR_GIB: u64 = 4 * 1024 * 1024 * 1024;
             let size = if file_size >= 10 + 8 {
                 reader.seek(SeekFrom::Start(file_size - 4))?;
                 let mut buf = [0u8; 4];
                 if reader.read_exact(&mut buf).is_ok() {
-                    Some(u32::from_le_bytes(buf) as u64)
+                    let isize = u32::from_le_bytes(buf) as u64;
+                    // In DEFLATE (RFC 1951), compressed container overhead can exceed uncompressed
+                    // payload size only for small files (< 64 KiB). If compressed file_size >= 4 GiB
+                    // or file_size exceeds reported ISIZE by more than 64 KiB, ISIZE has wrapped
+                    // modulo 2^32 or is indeterminate.
+                    if file_size >= FOUR_GIB || file_size > isize.saturating_add(64 * 1024) {
+                        None
+                    } else {
+                        Some(isize)
+                    }
                 } else {
                     None
                 }
@@ -174,7 +188,10 @@ fn find_best_zip_image_entry<R: Read + Seek>(archive: &mut zip::ZipArchive<R>) -
         if let Ok(file) = archive.by_index(i) {
             let name = file.name().to_ascii_lowercase();
             // Skip directory entries and macOS metadata
-            if name.ends_with('/') || name.contains("__macosx") {
+            if name.ends_with('/')
+                || name.contains("__macosx")
+                || name.split('/').any(|seg| seg.starts_with("._"))
+            {
                 continue;
             }
 
