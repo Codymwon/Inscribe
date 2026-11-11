@@ -5,6 +5,7 @@ pub mod error;
 pub mod image;
 pub mod progress;
 pub mod target;
+pub mod writer;
 
 // Re-exports for convenient top-level access
 pub use drive::{BusType, DriveGuard, DriveInfo, DriveScanner, MockDriveScanner};
@@ -15,3 +16,4 @@ pub use image::{
 };
 pub use progress::{FlashPhase, FlashProgress};
 pub use target::{BlockTarget, MultiBlockTarget};
+pub use writer::AlignedBuffer;
