@@ -348,14 +348,7 @@ impl BlockTarget for BlockDeviceWriter {
             let total_needed = intra_offset
                 .checked_add(buffer.len())
                 .ok_or_else(|| InscribeError::Other("Read buffer length overflow".to_string()))?;
-            let rem = total_needed % block_size;
-            let padded_len = if rem == 0 {
-                total_needed
-            } else {
-                total_needed.checked_add(block_size - rem).ok_or_else(|| {
-                    InscribeError::Other("Read buffer length overflow".to_string())
-                })?
-            };
+            let padded_len = super::aligned::round_up_to_alignment(total_needed, block_size)?;
 
             let mut bounce = AlignedBuffer::with_capacity_and_alignment(padded_len, block_size)?;
             bounce.set_len(padded_len)?;

@@ -55,25 +55,7 @@ impl AlignedBuffer {
             ));
         }
 
-        if alignment == 0 || !alignment.is_power_of_two() {
-            return Err(InscribeError::Other(format!(
-                "Invalid alignment {alignment}: must be a non-zero power of two"
-            )));
-        }
-
-        // Layout requires size to be rounded up to multiple of align
-        let layout_size = if capacity % alignment == 0 {
-            capacity
-        } else {
-            capacity
-                .checked_add(alignment - (capacity % alignment))
-                .ok_or_else(|| {
-                    InscribeError::Other(
-                        "Buffer capacity overflow during alignment calculation".to_string(),
-                    )
-                })?
-        };
-
+        let layout_size = round_up_to_alignment(capacity, alignment)?;
         let layout = Layout::from_size_align(layout_size, alignment).map_err(|e| {
             InscribeError::Other(format!(
                 "Invalid layout for capacity {layout_size} and alignment {alignment}: {e}"
@@ -106,21 +88,7 @@ impl AlignedBuffer {
             ));
         }
 
-        if alignment == 0 || !alignment.is_power_of_two() {
-            return Err(InscribeError::Other(format!(
-                "Invalid alignment {alignment}: must be a non-zero power of two"
-            )));
-        }
-
-        let rem = data.len() % alignment;
-        let padded_len = if rem == 0 {
-            data.len()
-        } else {
-            data.len().checked_add(alignment - rem).ok_or_else(|| {
-                InscribeError::Other("Integer overflow during padding calculation".to_string())
-            })?
-        };
-
+        let padded_len = round_up_to_alignment(data.len(), alignment)?;
         let mut buf = Self::with_capacity_and_alignment(padded_len, alignment)?;
         buf.len = padded_len;
 
@@ -184,26 +152,15 @@ impl AlignedBuffer {
 
     /// Pads the current logical length up to the nearest multiple of `alignment` with `0x00`.
     pub fn pad_to_alignment(&mut self, alignment: usize) -> Result<(), InscribeError> {
-        if alignment == 0 || !alignment.is_power_of_two() {
+        let padded_len = round_up_to_alignment(self.len, alignment)?;
+        if padded_len > self.layout.size() {
             return Err(InscribeError::Other(format!(
-                "Invalid alignment {alignment}: must be a non-zero power of two"
+                "Padded length {padded_len} exceeds buffer capacity {}",
+                self.layout.size()
             )));
         }
 
-        let rem = self.len % alignment;
-        if rem != 0 {
-            let padded_len = self
-                .len
-                .checked_add(alignment - rem)
-                .ok_or_else(|| InscribeError::Other("Padding overflow".to_string()))?;
-
-            if padded_len > self.layout.size() {
-                return Err(InscribeError::Other(format!(
-                    "Padded length {padded_len} exceeds buffer capacity {}",
-                    self.layout.size()
-                )));
-            }
-
+        if padded_len > self.len {
             // Zero out trailing sector bytes
             unsafe {
                 std::ptr::write_bytes(self.ptr.as_ptr().add(self.len), 0x00, padded_len - self.len);
@@ -247,6 +204,23 @@ impl Drop for AlignedBuffer {
         unsafe {
             dealloc(self.ptr.as_ptr(), self.layout);
         }
+    }
+}
+
+/// Rounds `len` up to the nearest multiple of `alignment`, validating that alignment is a power of two.
+pub(crate) fn round_up_to_alignment(len: usize, alignment: usize) -> Result<usize, InscribeError> {
+    if alignment == 0 || !alignment.is_power_of_two() {
+        return Err(InscribeError::Other(format!(
+            "Invalid alignment {alignment}: must be a non-zero power of two"
+        )));
+    }
+    let rem = len % alignment;
+    if rem == 0 {
+        Ok(len)
+    } else {
+        len.checked_add(alignment - rem).ok_or_else(|| {
+            InscribeError::Other("Integer overflow during alignment calculation".to_string())
+        })
     }
 }
 
