@@ -64,32 +64,16 @@ pub fn detect_format(header: &[u8], path: Option<&Path>) -> ImageFormat {
 /// Detects image format based solely on file extension.
 #[must_use]
 pub fn detect_from_path(path: &Path) -> Option<ImageFormat> {
-    let file_name = path.file_name()?.to_string_lossy().to_ascii_lowercase();
-
-    if file_name.ends_with(".iso")
-        || file_name.ends_with(".img")
-        || file_name.ends_with(".raw")
-        || file_name.ends_with(".bin")
-    {
-        return Some(ImageFormat::Raw);
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    match ext.as_str() {
+        "iso" | "img" | "raw" | "bin" => Some(ImageFormat::Raw),
+        "gz" => Some(ImageFormat::Gz),
+        "xz" => Some(ImageFormat::Xz),
+        "zst" | "zstd" => Some(ImageFormat::Zstd),
+        "bz2" => Some(ImageFormat::Bzip2),
+        "zip" => Some(ImageFormat::Zip),
+        _ => None,
     }
-    if file_name.ends_with(".gz") {
-        return Some(ImageFormat::Gz);
-    }
-    if file_name.ends_with(".xz") {
-        return Some(ImageFormat::Xz);
-    }
-    if file_name.ends_with(".zst") || file_name.ends_with(".zstd") {
-        return Some(ImageFormat::Zstd);
-    }
-    if file_name.ends_with(".bz2") {
-        return Some(ImageFormat::Bzip2);
-    }
-    if file_name.ends_with(".zip") {
-        return Some(ImageFormat::Zip);
-    }
-
-    None
 }
 
 /// Inspects a seekable image stream, extracting total file size and uncompressed payload size if available.
@@ -122,7 +106,8 @@ pub fn inspect_image<R: Read + Seek>(
         ImageFormat::Zip => {
             // Source: https://docs.rs/zip/latest/zip/read/struct.ZipArchive.html
             let size = if let Ok(mut archive) = zip::ZipArchive::new(&mut *reader) {
-                find_best_zip_image_entry(&mut archive)
+                super::decompress::find_best_zip_entry_index(&mut archive)
+                    .and_then(|idx| archive.by_index(idx).ok().map(|f| f.size()))
             } else {
                 None
             };
@@ -177,41 +162,6 @@ pub fn inspect_image<R: Read + Seek>(
         uncompressed_size,
         format,
     ))
-}
-
-/// Helper to select the most probable disk image entry from a ZIP archive.
-fn find_best_zip_image_entry<R: Read + Seek>(archive: &mut zip::ZipArchive<R>) -> Option<u64> {
-    let mut best_index: Option<usize> = None;
-    let mut best_size: u64 = 0;
-
-    for i in 0..archive.len() {
-        if let Ok(file) = archive.by_index(i) {
-            let name = file.name().to_ascii_lowercase();
-            // Skip directory entries and macOS metadata
-            if name.ends_with('/')
-                || name.contains("__macosx")
-                || name.split('/').any(|seg| seg.starts_with("._"))
-            {
-                continue;
-            }
-
-            let is_image_ext = name.ends_with(".img")
-                || name.ends_with(".iso")
-                || name.ends_with(".raw")
-                || name.ends_with(".bin");
-
-            if is_image_ext {
-                return Some(file.size());
-            }
-
-            if file.size() > best_size {
-                best_size = file.size();
-                best_index = Some(i);
-            }
-        }
-    }
-
-    best_index.and_then(|idx| archive.by_index(idx).ok().map(|f| f.size()))
 }
 
 #[cfg(test)]

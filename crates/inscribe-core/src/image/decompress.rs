@@ -119,7 +119,7 @@ pub fn open_decompressor<R: Read + Send + 'static>(
                 // Sequentially scan entries in the non-seekable stream, skipping directory
                 // headers and macOS metadata to find the real disk image payload.
                 loop {
-                    let mut zip_file = match zip::read::read_zipfile_from_stream(&mut reader) {
+                    let zip_file = match zip::read::read_zipfile_from_stream(&mut reader) {
                         Ok(Some(file)) => file,
                         Ok(None) => return, // End of archive stream
                         Err(e) => {
@@ -130,41 +130,12 @@ pub fn open_decompressor<R: Read + Send + 'static>(
                     };
 
                     let name = zip_file.name().to_ascii_lowercase();
-                    let is_dir = zip_file.is_dir() || name.ends_with('/');
-                    let is_macos_meta = name.contains("__macosx")
-                        || name.split('/').any(|seg| seg.starts_with("._"));
-                    let is_doc = name.ends_with(".txt")
-                        || name.ends_with(".md")
-                        || name.ends_with(".nfo")
-                        || name.ends_with(".pdf")
-                        || name.ends_with(".html")
-                        || name.ends_with(".htm")
-                        || name.ends_with(".json")
-                        || name.ends_with(".xml")
-                        || name.ends_with(".yaml")
-                        || name.ends_with(".yml")
-                        || name.ends_with(".rtf");
-
-                    if is_dir || is_macos_meta || is_doc {
+                    if is_zip_metadata_or_dir(&name, zip_file.is_dir()) || is_doc_filename(&name) {
                         // Dropping zip_file advances reader past entry payload
                         continue;
                     }
 
-                    let mut buffer = vec![0u8; 64 * 1024];
-                    loop {
-                        match zip_file.read(&mut buffer) {
-                            Ok(0) => break,
-                            Ok(n) => {
-                                if tx.send(Ok(buffer[..n].to_vec())).is_err() {
-                                    return;
-                                }
-                            }
-                            Err(e) => {
-                                let _ = tx.send(Err(e));
-                                return;
-                            }
-                        }
-                    }
+                    pump_reader_to_channel(zip_file, tx);
                     break;
                 }
             });
@@ -215,35 +186,8 @@ pub fn open_seekable_decompressor<R: Read + Seek + Send + 'static>(
                     }
                 };
 
-                // Find the best entry to flash
-                let mut target_index = 0;
-                let mut best_size: u64 = 0;
-
-                for i in 0..archive.len() {
-                    if let Ok(file) = archive.by_index(i) {
-                        let name = file.name().to_ascii_lowercase();
-                        if name.ends_with('/')
-                            || name.contains("__macosx")
-                            || name.split('/').any(|seg| seg.starts_with("._"))
-                        {
-                            continue;
-                        }
-                        let is_image = name.ends_with(".img")
-                            || name.ends_with(".iso")
-                            || name.ends_with(".raw")
-                            || name.ends_with(".bin");
-                        if is_image {
-                            target_index = i;
-                            break;
-                        }
-                        if file.size() > best_size {
-                            best_size = file.size();
-                            target_index = i;
-                        }
-                    }
-                }
-
-                let mut file = match archive.by_index(target_index) {
+                let target_index = find_best_zip_entry_index(&mut archive).unwrap_or(0);
+                let file = match archive.by_index(target_index) {
                     Ok(f) => f,
                     Err(e) => {
                         let _ =
@@ -252,21 +196,7 @@ pub fn open_seekable_decompressor<R: Read + Seek + Send + 'static>(
                     }
                 };
 
-                let mut buffer = vec![0u8; 64 * 1024];
-                loop {
-                    match file.read(&mut buffer) {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            if tx.send(Ok(buffer[..n].to_vec())).is_err() {
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            let _ = tx.send(Err(e));
-                            break;
-                        }
-                    }
-                }
+                pump_reader_to_channel(file, tx);
             });
 
             Ok(Box::new(ChannelReader::new(rx, handle)))
@@ -274,6 +204,84 @@ pub fn open_seekable_decompressor<R: Read + Seek + Send + 'static>(
         // Non-seekable or non-MT formats delegate to open_decompressor
         other => open_decompressor(reader, other),
     }
+}
+
+/// Helper to stream chunks from a `Read` source into a channel.
+fn pump_reader_to_channel<R: Read>(
+    mut reader: R,
+    tx: crossbeam_channel::Sender<std::io::Result<Vec<u8>>>,
+) {
+    let mut buffer = vec![0u8; 64 * 1024];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(n) => {
+                if tx.send(Ok(buffer[..n].to_vec())).is_err() {
+                    break;
+                }
+            }
+            Err(e) => {
+                let _ = tx.send(Err(e));
+                break;
+            }
+        }
+    }
+}
+
+/// Returns true if a ZIP entry name represents a directory or macOS resource metadata.
+pub(crate) fn is_zip_metadata_or_dir(name: &str, is_dir: bool) -> bool {
+    is_dir
+        || name.ends_with('/')
+        || name.contains("__macosx")
+        || name.split('/').any(|seg| seg.starts_with("._"))
+}
+
+/// Returns true if a filename matches disk image extensions (.img, .iso, .raw, .bin).
+pub(crate) fn is_image_filename(name: &str) -> bool {
+    matches!(
+        std::path::Path::new(name)
+            .extension()
+            .and_then(|e| e.to_str()),
+        Some("img" | "iso" | "raw" | "bin")
+    )
+}
+
+/// Returns true if a filename matches documentation file extensions.
+pub(crate) fn is_doc_filename(name: &str) -> bool {
+    matches!(
+        std::path::Path::new(name)
+            .extension()
+            .and_then(|e| e.to_str()),
+        Some(
+            "txt" | "md" | "nfo" | "pdf" | "html" | "htm" | "json" | "xml" | "yaml" | "yml" | "rtf"
+        )
+    )
+}
+
+/// Helper to select the most probable disk image entry index from a ZIP archive.
+pub(crate) fn find_best_zip_entry_index<R: Read + Seek>(
+    archive: &mut zip::ZipArchive<R>,
+) -> Option<usize> {
+    let mut best_index: Option<usize> = None;
+    let mut best_size: u64 = 0;
+
+    for i in 0..archive.len() {
+        if let Ok(file) = archive.by_index(i) {
+            let name = file.name().to_ascii_lowercase();
+            if is_zip_metadata_or_dir(&name, file.is_dir()) {
+                continue;
+            }
+            if is_image_filename(&name) {
+                return Some(i);
+            }
+            if file.size() > best_size {
+                best_size = file.size();
+                best_index = Some(i);
+            }
+        }
+    }
+
+    best_index
 }
 
 #[cfg(test)]
