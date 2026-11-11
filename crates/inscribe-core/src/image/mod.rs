@@ -1,10 +1,14 @@
 //! Disk image metadata, compression format definitions, magic-byte detection, and streaming decompression.
 
+pub mod decompress;
 pub mod detector;
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+pub use decompress::{
+    ChannelReader, CountingReader, open_decompressor, open_seekable_decompressor,
+};
 pub use detector::{detect_format, detect_from_path, inspect_image};
 
 /// Supported disk image archive and container formats.
