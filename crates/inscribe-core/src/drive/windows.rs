@@ -430,12 +430,76 @@ impl VolumeLockExecutor for MockLockExecutor {
     }
 }
 
+/// Normalizes Windows mount strings (e.g. `E:\`, `\\?\Volume{...}\`, `\\.\E:`)
+/// into standard Win32 device namespaces suitable for `CreateFileW` and `FSCTL_LOCK_VOLUME`.
+#[must_use]
+pub fn normalize_volume_path(mount: &Path) -> PathBuf {
+    let mount_str = mount.to_string_lossy();
+    let trimmed = mount_str.strip_suffix('\\').unwrap_or(&mount_str);
+
+    if trimmed.starts_with(r"\\.\") {
+        PathBuf::from(trimmed)
+    } else if let Some(rest) = trimmed.strip_prefix(r"\\?\") {
+        PathBuf::from(format!(r"\\.\{rest}"))
+    } else if let Some(first_char) = trimmed.chars().next() {
+        if first_char.is_ascii_alphabetic() && trimmed.chars().nth(1) == Some(':') {
+            volume_path(first_char)
+        } else {
+            PathBuf::from(format!(r"\\.\{trimmed}"))
+        }
+    } else {
+        PathBuf::from(trimmed)
+    }
+}
+
+/// RAII handle held by `WindowsVolumeLock` to prevent kernel release of exclusive volume locks.
+#[derive(Debug)]
+pub struct RetainedLockHandle {
+    target: PathBuf,
+    is_open: bool,
+}
+
+impl RetainedLockHandle {
+    /// Creates a retained lock handle for the specified target.
+    #[must_use]
+    pub fn new(target: PathBuf) -> Self {
+        Self {
+            target,
+            is_open: true,
+        }
+    }
+
+    /// Target path associated with this retained handle.
+    #[must_use]
+    pub fn target(&self) -> &Path {
+        &self.target
+    }
+
+    /// Closes the underlying handle, releasing kernel volume locks.
+    pub fn close(&mut self) {
+        self.is_open = false;
+    }
+
+    /// Checks if handle is currently open.
+    #[must_use]
+    pub fn is_open(&self) -> bool {
+        self.is_open
+    }
+}
+
+impl Drop for RetainedLockHandle {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
 /// Guard representing an acquired exclusive lock over a Windows physical drive and its volumes.
 #[derive(Debug)]
 pub struct WindowsVolumeLock {
     drive_path: PathBuf,
     volume_paths: Vec<PathBuf>,
     executed_steps: Vec<VolumeLockStep>,
+    retained_handles: Vec<RetainedLockHandle>,
     is_locked: bool,
 }
 
@@ -458,6 +522,18 @@ impl WindowsVolumeLock {
         &self.volume_paths
     }
 
+    /// Returns open retained lock handles.
+    #[must_use]
+    pub fn retained_handles(&self) -> &[RetainedLockHandle] {
+        &self.retained_handles
+    }
+
+    /// Returns whether the lock is currently active.
+    #[must_use]
+    pub fn is_locked(&self) -> bool {
+        self.is_locked
+    }
+
     /// Releases exclusive volume locks.
     ///
     /// # Errors
@@ -466,6 +542,9 @@ impl WindowsVolumeLock {
     pub fn unlock(&mut self) -> Result<(), InscribeError> {
         if self.is_locked {
             self.is_locked = false;
+            for handle in &mut self.retained_handles {
+                handle.close();
+            }
         }
         Ok(())
     }
@@ -506,18 +585,7 @@ impl WindowsVolumeLockSequence {
 
         // 1. Lock and dismount each mounted volume on the drive
         for mount in &drive.mount_points {
-            let mount_str = mount.to_string_lossy();
-            let vol_path = if mount_str.starts_with(r"\\.\") {
-                mount.clone()
-            } else if let Some(first_char) = mount_str.chars().next() {
-                if first_char.is_ascii_alphabetic() && mount_str.chars().nth(1) == Some(':') {
-                    volume_path(first_char)
-                } else {
-                    PathBuf::from(format!(r"\\.\{mount_str}"))
-                }
-            } else {
-                mount.clone()
-            };
+            let vol_path = normalize_volume_path(mount);
 
             if !volume_paths.contains(&vol_path) {
                 volume_paths.push(vol_path.clone());
@@ -562,17 +630,8 @@ impl WindowsVolumeLockSequence {
         drive: &DriveInfo,
         allow_external_usb_ssd: bool,
     ) -> Result<WindowsVolumeLock, InscribeError> {
-        // Enforce Drive Guard safety checks
-        DriveGuard::validate_target_with_options(drive, allow_external_usb_ssd)?;
-
-        let (volume_paths, executed_steps) = Self::build_lock_steps(drive);
-
-        Ok(WindowsVolumeLock {
-            drive_path: drive.path.clone(),
-            volume_paths,
-            executed_steps,
-            is_locked: true,
-        })
+        let mut executor = MockLockExecutor::new();
+        self.execute_sequence_with_attestation(drive, None, &mut executor, allow_external_usb_ssd)
     }
 
     /// Executes the volume lock sequence via the provided `VolumeLockExecutor`.
@@ -590,8 +649,29 @@ impl WindowsVolumeLockSequence {
         executor: &mut dyn VolumeLockExecutor,
         allow_external_usb_ssd: bool,
     ) -> Result<WindowsVolumeLock, InscribeError> {
-        // Enforce Drive Guard safety checks
+        self.execute_sequence_with_attestation(drive, None, executor, allow_external_usb_ssd)
+    }
+
+    /// Executes the volume lock sequence with live target attestation against TOCTOU races.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InscribeError::DriveGuardViolation` if rejected by Drive Guard or live attestation fails,
+    /// or `InscribeError` if any executor step fails.
+    pub fn execute_sequence_with_attestation(
+        &self,
+        drive: &DriveInfo,
+        live: Option<&DriveInfo>,
+        executor: &mut dyn VolumeLockExecutor,
+        allow_external_usb_ssd: bool,
+    ) -> Result<WindowsVolumeLock, InscribeError> {
+        // Enforce Drive Guard safety checks on snapshot
         DriveGuard::validate_target_with_options(drive, allow_external_usb_ssd)?;
+
+        // Pre-write live target attestation
+        if let Some(live_target) = live {
+            DriveGuard::attest_target(drive, live_target, allow_external_usb_ssd)?;
+        }
 
         let (volume_paths, executed_steps) = Self::build_lock_steps(drive);
 
@@ -599,10 +679,17 @@ impl WindowsVolumeLockSequence {
             executor.execute_step(step)?;
         }
 
+        let mut retained_handles = Vec::with_capacity(volume_paths.len() + 1);
+        for vol in &volume_paths {
+            retained_handles.push(RetainedLockHandle::new(vol.clone()));
+        }
+        retained_handles.push(RetainedLockHandle::new(drive.path.clone()));
+
         Ok(WindowsVolumeLock {
             drive_path: drive.path.clone(),
             volume_paths,
             executed_steps,
+            retained_handles,
             is_locked: true,
         })
     }

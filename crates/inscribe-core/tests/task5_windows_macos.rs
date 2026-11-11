@@ -2,13 +2,15 @@
 
 use inscribe_core::drive::macos::{
     DADISK_CLAIM_OPTION_DEFAULT, DADISK_UNMOUNT_OPTION_FORCE, DADISK_UNMOUNT_OPTION_WHOLE,
-    MacDiskClaim, bsd_name, interconnect_to_bus_type, to_block_device, to_raw_character_device,
+    MacDiskClaim, bsd_name, interconnect_to_bus_type, to_block_device,
+    to_raw_character_device,
 };
 use inscribe_core::drive::windows::{
     FSCTL_DISMOUNT_VOLUME, FSCTL_LOCK_VOLUME, FSCTL_UNLOCK_VOLUME, IOCTL_DISK_DELETE_DRIVE_LAYOUT,
     IOCTL_STORAGE_QUERY_PROPERTY, MockLockExecutor, StorageBusType, StorageDeviceDescriptor,
     StoragePropertyId, StoragePropertyQuery, StorageQueryType, VolumeLockExecutor, VolumeLockStep,
-    WindowsVolumeLockSequence, parse_physical_drive_index, physical_drive_path, volume_path,
+    WindowsVolumeLockSequence, normalize_volume_path, parse_physical_drive_index,
+    physical_drive_path, volume_path,
 };
 use inscribe_core::drive::{BusType, DriveInfo};
 use inscribe_core::error::InscribeError;
@@ -438,3 +440,116 @@ fn test_windows_volume_lock_sequence_executor_error_propagation() {
         other => panic!("Expected DeviceLockFailed, got {other:?}"),
     }
 }
+
+#[test]
+fn test_windows_volume_guid_normalization() {
+    assert_eq!(
+        normalize_volume_path(Path::new(
+            r"\\?\Volume{12345678-1234-1234-1234-123456789abc}\"
+        )),
+        PathBuf::from(r"\\.\Volume{12345678-1234-1234-1234-123456789abc}")
+    );
+    assert_eq!(
+        normalize_volume_path(Path::new(
+            r"\\?\Volume{12345678-1234-1234-1234-123456789abc}"
+        )),
+        PathBuf::from(r"\\.\Volume{12345678-1234-1234-1234-123456789abc}")
+    );
+    assert_eq!(
+        normalize_volume_path(Path::new(r"E:\")),
+        PathBuf::from(r"\\.\E:")
+    );
+
+    let drive_with_guid = DriveInfo {
+        path: PathBuf::from(r"\\.\PhysicalDrive3"),
+        model: "USB".to_string(),
+        vendor: "Test".to_string(),
+        size: 32_000_000_000,
+        sector_size: 512,
+        bus_type: BusType::Usb,
+        is_removable: true,
+        is_read_only: false,
+        is_system: false,
+        mount_points: vec![PathBuf::from(
+            r"\\?\Volume{12345678-1234-1234-1234-123456789abc}\",
+        )],
+    };
+
+    let lock_seq = WindowsVolumeLockSequence::new();
+    let lock = lock_seq
+        .execute_lock_sequence(&drive_with_guid)
+        .expect("Lock sequence with GUID volume must succeed");
+    assert_eq!(
+        lock.executed_steps()[0],
+        VolumeLockStep::LockVolume(PathBuf::from(
+            r"\\.\Volume{12345678-1234-1234-1234-123456789abc}"
+        ))
+    );
+}
+
+#[test]
+fn test_windows_volume_lock_raii_handle_retention() {
+    let lock_seq = WindowsVolumeLockSequence::new();
+    let drive = DriveInfo {
+        path: PathBuf::from(r"\\.\PhysicalDrive2"),
+        model: "Flash".to_string(),
+        vendor: "SanDisk".to_string(),
+        size: 32_000_000_000,
+        sector_size: 512,
+        bus_type: BusType::Usb,
+        is_removable: true,
+        is_read_only: false,
+        is_system: false,
+        mount_points: vec![PathBuf::from(r"E:\"), PathBuf::from(r"F:\")],
+    };
+
+    let mut lock = lock_seq
+        .execute_lock_sequence(&drive)
+        .expect("Must lock drive");
+
+    // Must hold open handles for all 2 volumes + 1 physical drive
+    assert_eq!(lock.retained_handles().len(), 3);
+    for h in lock.retained_handles() {
+        assert!(h.is_open());
+    }
+
+    // Explicit unlock releases handles
+    lock.unlock().expect("Must unlock cleanly");
+    assert!(!lock.is_locked());
+    for h in lock.retained_handles() {
+        assert!(!h.is_open());
+    }
+}
+
+#[test]
+fn test_windows_volume_lock_sequence_attestation_detects_swapped_device() {
+    let lock_seq = WindowsVolumeLockSequence::new();
+    let scan_drive = DriveInfo {
+        path: PathBuf::from(r"\\.\PhysicalDrive2"),
+        model: "Flash".to_string(),
+        vendor: "SanDisk".to_string(),
+        size: 32_000_000_000,
+        sector_size: 512,
+        bus_type: BusType::Usb,
+        is_removable: true,
+        is_read_only: false,
+        is_system: false,
+        mount_points: vec![],
+    };
+
+    let mut swapped_live = scan_drive.clone();
+    swapped_live.bus_type = BusType::Nvme;
+
+    let mut executor = MockLockExecutor::new();
+    let res = lock_seq.execute_sequence_with_attestation(
+        &scan_drive,
+        Some(&swapped_live),
+        &mut executor,
+        false,
+    );
+    assert!(
+        res.is_err(),
+        "Live attestation must reject execution when device swapped to NVMe"
+    );
+}
+
