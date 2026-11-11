@@ -7,11 +7,12 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Linux block device scanner that inspects sysfs and `/proc/mounts`.
+/// Linux block device scanner that inspects sysfs, `/proc/mounts`, and `/proc/swaps`.
 #[derive(Debug, Clone)]
 pub struct LinuxDriveScanner {
     sysfs_block_dir: PathBuf,
     proc_mounts_file: PathBuf,
+    proc_swaps_file: PathBuf,
 }
 
 impl Default for LinuxDriveScanner {
@@ -21,12 +22,13 @@ impl Default for LinuxDriveScanner {
 }
 
 impl LinuxDriveScanner {
-    /// Creates a new `LinuxDriveScanner` targeting system standard `/sys/class/block` and `/proc/mounts`.
+    /// Creates a new `LinuxDriveScanner` targeting system standard `/sys/class/block`, `/proc/mounts`, and `/proc/swaps`.
     #[must_use]
     pub fn new() -> Self {
         Self {
             sysfs_block_dir: PathBuf::from("/sys/class/block"),
             proc_mounts_file: PathBuf::from("/proc/mounts"),
+            proc_swaps_file: PathBuf::from("/proc/swaps"),
         }
     }
 
@@ -36,13 +38,27 @@ impl LinuxDriveScanner {
         sysfs_block_dir: impl Into<PathBuf>,
         proc_mounts_file: impl Into<PathBuf>,
     ) -> Self {
+        let proc_mounts = proc_mounts_file.into();
+        let default_swaps = proc_mounts
+            .parent()
+            .map(|p| p.join("swaps"))
+            .unwrap_or_else(|| PathBuf::from("/proc/swaps"));
         Self {
             sysfs_block_dir: sysfs_block_dir.into(),
-            proc_mounts_file: proc_mounts_file.into(),
+            proc_mounts_file: proc_mounts,
+            proc_swaps_file: default_swaps,
         }
     }
 
-    /// Parses `/proc/mounts` and maps device node paths to their active mount points.
+    /// Configures custom `/proc/swaps` path for deterministic testing.
+    #[must_use]
+    pub fn with_swaps_path(mut self, proc_swaps_file: impl Into<PathBuf>) -> Self {
+        self.proc_swaps_file = proc_swaps_file.into();
+        self
+    }
+
+    /// Parses `/proc/mounts` and maps device node paths to their active mount points,
+    /// canonicalizing symlinks to resolve paths like `/dev/disk/by-uuid/<UUID>` and `/dev/mapper/...`.
     ///
     /// # Errors
     ///
@@ -63,13 +79,47 @@ impl LinuxDriveScanner {
                 let mount = parts[1];
                 if spec.starts_with('/') {
                     let decoded_mount = unescape_octal(mount);
-                    map.entry(PathBuf::from(spec))
+                    let spec_path = Path::new(spec);
+                    let resolved_spec =
+                        fs::canonicalize(spec_path).unwrap_or_else(|_| PathBuf::from(spec));
+                    map.entry(resolved_spec)
                         .or_default()
                         .push(PathBuf::from(decoded_mount));
                 }
             }
         }
         Ok(map)
+    }
+
+    /// Parses `/proc/swaps` and extracts active swap device paths.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InscribeError::Io` if `/proc/swaps` exists but cannot be read.
+    pub fn parse_swaps(swaps_file: &Path) -> Result<Vec<PathBuf>, InscribeError> {
+        let mut swaps = Vec::new();
+        if !swaps_file.exists() {
+            return Ok(swaps);
+        }
+
+        let content = fs::read_to_string(swaps_file)?;
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with("Filename") {
+                continue;
+            }
+            let parts: Vec<&str> = trimmed.split_whitespace().collect();
+            if let Some(&dev_spec) = parts.first() {
+                if dev_spec.starts_with('/') {
+                    let path = PathBuf::from(dev_spec);
+                    let resolved = fs::canonicalize(&path).unwrap_or(path);
+                    if !swaps.contains(&resolved) {
+                        swaps.push(resolved);
+                    }
+                }
+            }
+        }
+        Ok(swaps)
     }
 
     /// Determines the hardware bus interconnect type from a device's sysfs path.
@@ -140,9 +190,10 @@ pub fn is_partition_of(disk: &Path, candidate: &Path) -> bool {
     }
 }
 
-/// Decodes octal escape sequences in `/proc/mounts` (e.g. `\040` -> `' '`).
-fn unescape_octal(input: &str) -> String {
-    let mut result = String::with_capacity(input.len());
+/// Decodes octal escape sequences in `/proc/mounts` (e.g. `\040` -> `' '`, `\303\251` -> `é`).
+#[must_use]
+pub fn unescape_octal(input: &str) -> String {
+    let mut raw_bytes = Vec::with_capacity(input.len());
     let mut chars = input.chars().peekable();
 
     while let Some(c) = chars.next() {
@@ -160,17 +211,19 @@ fn unescape_octal(input: &str) -> String {
             }
             if octal.len() == 3 {
                 if let Ok(byte) = u8::from_str_radix(&octal, 8) {
-                    result.push(byte as char);
+                    raw_bytes.push(byte);
                     continue;
                 }
             }
-            result.push('\\');
-            result.push_str(&octal);
+            raw_bytes.push(b'\\');
+            raw_bytes.extend_from_slice(octal.as_bytes());
         } else {
-            result.push(c);
+            let mut buf = [0u8; 4];
+            let encoded = c.encode_utf8(&mut buf);
+            raw_bytes.extend_from_slice(encoded.as_bytes());
         }
     }
-    result
+    String::from_utf8_lossy(&raw_bytes).into_owned()
 }
 
 impl DriveScanner for LinuxDriveScanner {
@@ -179,7 +232,49 @@ impl DriveScanner for LinuxDriveScanner {
             return Ok(Vec::new());
         }
 
-        let mounts_map = Self::parse_mounts(&self.proc_mounts_file)?;
+        let mut mounts_map = Self::parse_mounts(&self.proc_mounts_file)?;
+
+        // Correlate Device Mapper slaves (/sys/class/block/dm-*/slaves/) back to mapped volumes
+        if let Ok(entries) = fs::read_dir(&self.sysfs_block_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with("dm-") {
+                    let dm_dev_path = PathBuf::from(format!("/dev/{name}"));
+                    let mut dm_mounts = Vec::new();
+                    if let Some(mounts) = mounts_map.get(&dm_dev_path) {
+                        dm_mounts.extend(mounts.clone());
+                    }
+                    if let Ok(canonical_dm) = fs::canonicalize(&dm_dev_path) {
+                        if let Some(mounts) = mounts_map.get(&canonical_dm) {
+                            for m in mounts {
+                                if !dm_mounts.contains(m) {
+                                    dm_mounts.push(m.clone());
+                                }
+                            }
+                        }
+                    }
+
+                    if !dm_mounts.is_empty() {
+                        let slaves_dir = entry.path().join("slaves");
+                        if let Ok(slave_entries) = fs::read_dir(slaves_dir) {
+                            for slave_entry in slave_entries.flatten() {
+                                let slave_name =
+                                    slave_entry.file_name().to_string_lossy().into_owned();
+                                let slave_path = PathBuf::from(format!("/dev/{slave_name}"));
+                                let list = mounts_map.entry(slave_path).or_default();
+                                for m in &dm_mounts {
+                                    if !list.contains(m) {
+                                        list.push(m.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let swap_devices = Self::parse_swaps(&self.proc_swaps_file).unwrap_or_default();
         let mut drives = Vec::new();
 
         let entries = fs::read_dir(&self.sysfs_block_dir)?;
@@ -189,10 +284,11 @@ impl DriveScanner for LinuxDriveScanner {
             let file_name = entry.file_name();
             let dev_name = file_name.to_string_lossy();
 
-            // Skip virtual / loop / ram devices
+            // Skip virtual / loop / ram / dm devices
             if dev_name.starts_with("loop")
                 || dev_name.starts_with("ram")
                 || dev_name.starts_with("zram")
+                || dev_name.starts_with("dm-")
             {
                 continue;
             }
@@ -265,6 +361,16 @@ impl DriveScanner for LinuxDriveScanner {
                 }
             }
 
+            // Cross-reference active swap partitions
+            for swap_dev in &swap_devices {
+                if swap_dev == &dev_node_path || is_partition_of(&dev_node_path, swap_dev) {
+                    let swap_label = PathBuf::from("[SWAP]");
+                    if !drive_mount_points.contains(&swap_label) {
+                        drive_mount_points.push(swap_label);
+                    }
+                }
+            }
+
             // Flag as system disk if any active mount point is a critical OS mount
             let is_system = drive_mount_points.iter().any(|m| is_system_mount(m));
 
@@ -296,6 +402,7 @@ mod tests {
         temp_dir: PathBuf,
         sysfs_block: PathBuf,
         proc_mounts: PathBuf,
+        proc_swaps: PathBuf,
     }
 
     impl TempMockSysfs {
@@ -305,14 +412,17 @@ mod tests {
             let _ = fs::remove_dir_all(&temp_dir);
             let sysfs_block = temp_dir.join("sys/class/block");
             let proc_mounts = temp_dir.join("proc/mounts");
+            let proc_swaps = temp_dir.join("proc/swaps");
             fs::create_dir_all(&sysfs_block).unwrap();
             fs::create_dir_all(proc_mounts.parent().unwrap()).unwrap();
             File::create(&proc_mounts).unwrap();
+            File::create(&proc_swaps).unwrap();
 
             Self {
                 temp_dir,
                 sysfs_block,
                 proc_mounts,
+                proc_swaps,
             }
         }
 
@@ -365,8 +475,23 @@ mod tests {
             fs::write(part_dir.join("partition"), format!("{part_num}\n")).unwrap();
         }
 
+        fn add_dm_device(&self, dm_name: &str, slave_devs: &[&str]) {
+            let dm_dir = self.sysfs_block.join(dm_name);
+            let slaves_dir = dm_dir.join("slaves");
+            fs::create_dir_all(&slaves_dir).unwrap();
+            for slave in slave_devs {
+                let slave_path = self.sysfs_block.join(slave);
+                #[cfg(unix)]
+                let _ = std::os::unix::fs::symlink(&slave_path, slaves_dir.join(slave));
+            }
+        }
+
         fn set_mounts(&self, content: &str) {
             fs::write(&self.proc_mounts, content).unwrap();
+        }
+
+        fn set_swaps(&self, content: &str) {
+            fs::write(&self.proc_swaps, content).unwrap();
         }
     }
 
@@ -490,6 +615,102 @@ mod tests {
         assert!(
             !system_drives.is_empty(),
             "Host scan must mark root backing disk as system disk"
+        );
+    }
+
+    #[test]
+    fn test_unescape_octal_multibyte_utf8() {
+        assert_eq!(
+            unescape_octal(r"/media/user/Caf\303\251\040Drive"),
+            "/media/user/Café Drive"
+        );
+        assert_eq!(unescape_octal(r"/media/user/T\303\274r"), "/media/user/Tür");
+        assert_eq!(unescape_octal(r"/simple/path"), "/simple/path");
+    }
+
+    #[test]
+    fn test_parse_mounts_symlink_canonicalization() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("inscribe_test_sym_mount_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let real_dev = temp_dir.join("sdb1");
+        fs::write(&real_dev, b"").unwrap();
+        let sym_dir = temp_dir.join("disk/by-uuid");
+        fs::create_dir_all(&sym_dir).unwrap();
+        let sym_dev = sym_dir.join("1234-5678");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real_dev, &sym_dev).unwrap();
+
+        let mounts_file = temp_dir.join("mounts");
+        fs::write(
+            &mounts_file,
+            format!("{} /mnt/data ext4 rw 0 0\n", sym_dev.display()),
+        )
+        .unwrap();
+
+        let parsed = LinuxDriveScanner::parse_mounts(&mounts_file).unwrap();
+        let canonical_real = fs::canonicalize(&real_dev).unwrap();
+        assert!(
+            parsed.contains_key(&canonical_real),
+            "Canonicalized target must be key in parsed mounts map"
+        );
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_device_mapper_slaves_mark_parent_disk_as_system() {
+        let fixture = TempMockSysfs::new("dm_test");
+        fixture.add_disk(
+            "sdb",
+            "pci0000:00/0000:00:14.0/usb1/1-2/1-2:1.0/host2/target2:0:0/2:0:0:0",
+            "SanDisk",
+            "Extreme",
+            31266816,
+            true,
+        );
+        fixture.add_partition("sdb2", 2);
+        // dm-0 is a mapped device (e.g. LUKS/LVM root) whose slave is sdb2
+        fixture.add_dm_device("dm-0", &["sdb2"]);
+        fixture.set_mounts("/dev/dm-0 / ext4 rw,relatime 0 0\n");
+
+        let scanner = LinuxDriveScanner::with_paths(&fixture.sysfs_block, &fixture.proc_mounts);
+        let drives = scanner.scan_drives().expect("Scanning must succeed");
+        assert_eq!(drives.len(), 1);
+        let drive = &drives[0];
+        assert_eq!(drive.path, PathBuf::from("/dev/sdb"));
+        assert!(
+            drive.is_system,
+            "Disk backing DM device mounted at / must be marked as system"
+        );
+        assert!(drive.mount_points.contains(&PathBuf::from("/")));
+    }
+
+    #[test]
+    fn test_proc_swaps_marks_backing_disk_as_system() {
+        let fixture = TempMockSysfs::new("swap_test");
+        fixture.add_disk(
+            "sdb",
+            "pci0000:00/0000:00:14.0/usb1/1-2/1-2:1.0/host2/target2:0:0/2:0:0:0",
+            "Kingston",
+            "DataTraveler",
+            31266816,
+            true,
+        );
+        fixture.add_partition("sdb1", 1);
+        fixture
+            .set_swaps("Filename\tType\tSize\tUsed\tPriority\n/dev/sdb1 partition 4194300 0 -2\n");
+
+        let scanner = LinuxDriveScanner::with_paths(&fixture.sysfs_block, &fixture.proc_mounts)
+            .with_swaps_path(&fixture.proc_swaps);
+        let drives = scanner.scan_drives().expect("Scanning must succeed");
+        assert_eq!(drives.len(), 1);
+        let drive = &drives[0];
+        assert_eq!(drive.path, PathBuf::from("/dev/sdb"));
+        assert!(
+            drive.is_system,
+            "Disk with active swap partition in /proc/swaps must be marked as system"
         );
     }
 }
