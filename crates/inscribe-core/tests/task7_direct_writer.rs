@@ -244,3 +244,53 @@ fn test_direct_writer_sequential_4mb_writes() {
 
     let _ = std::fs::remove_file(&test_file_path);
 }
+
+#[test]
+fn test_direct_writer_bounce_buffer_read_partial_sector_eof() {
+    let temp_dir = std::env::temp_dir();
+    let test_file_path = temp_dir.join(format!(
+        "inscribe_test_direct_eof_{}.img",
+        std::process::id()
+    ));
+
+    let file = File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&test_file_path)
+        .expect("Failed to create test target file");
+
+    let payload_size = 5000usize;
+    let options = WriterOptions {
+        direct_io: true,
+        block_size: 4096,
+        read_only: false,
+        capacity: Some(payload_size as u64),
+    };
+
+    let mut writer = BlockDeviceWriter::from_file(file, "direct-eof-writer".to_string(), options)
+        .expect("Failed to create BlockDeviceWriter");
+
+    // Write 5000 bytes of non-zero payload (sector 0: 4096 bytes, sector 1: 904 bytes + 3192 zeroes)
+    let payload = vec![0x7A; payload_size];
+    writer
+        .write_block(0, &payload)
+        .expect("Failed to write payload");
+    writer.sync().expect("Failed to sync");
+
+    // Read back the exact trailing partial sector at offset 4096 (length 904)
+    let mut trailing = vec![0u8; 904];
+    writer
+        .read_block(4096, &mut trailing)
+        .expect("Failed to read trailing partial sector at EOF");
+
+    // Must not be truncated to zeros!
+    assert_eq!(
+        trailing,
+        vec![0x7A; 904],
+        "Direct I/O bounce buffer read must not truncate partial trailing sector to zeros"
+    );
+
+    let _ = std::fs::remove_file(&test_file_path);
+}

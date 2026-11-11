@@ -383,12 +383,7 @@ impl BlockTarget for BlockDeviceWriter {
             }
 
             let read_target_len = if self.options.direct_io {
-                let rem_read = max_readable % block_size;
-                if rem_read == 0 {
-                    max_readable
-                } else {
-                    max_readable.saturating_sub(rem_read)
-                }
+                padded_len
             } else {
                 max_readable
             };
