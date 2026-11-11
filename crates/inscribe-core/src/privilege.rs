@@ -66,13 +66,7 @@ impl ElevationCommand {
     /// Source: <https://www.sudo.ws/docs/man/sudo.man/>
     #[must_use]
     pub fn sudo(program: &str, args: &[&str]) -> Self {
-        let mut full_args = Vec::with_capacity(args.len() + 1);
-        full_args.push(program.to_string());
-        full_args.extend(args.iter().map(|s| (*s).to_string()));
-        Self {
-            program: "sudo".to_string(),
-            args: full_args,
-        }
+        Self::with_prefix("sudo", program, args)
     }
 
     /// Constructs a Polkit `pkexec` elevation command line for Linux desktop.
@@ -80,11 +74,15 @@ impl ElevationCommand {
     /// Source: <https://www.freedesktop.org/software/polkit/docs/latest/pkexec.1.html>
     #[must_use]
     pub fn pkexec(program: &str, args: &[&str]) -> Self {
+        Self::with_prefix("pkexec", program, args)
+    }
+
+    fn with_prefix(wrapper: &str, program: &str, args: &[&str]) -> Self {
         let mut full_args = Vec::with_capacity(args.len() + 1);
         full_args.push(program.to_string());
         full_args.extend(args.iter().map(|s| (*s).to_string()));
         Self {
-            program: "pkexec".to_string(),
+            program: wrapper.to_string(),
             args: full_args,
         }
     }
@@ -515,15 +513,14 @@ impl PrivilegeManager {
         match os {
             "windows" => ElevationStrategy::WindowsUac,
             "macos" => {
-                if self.environment.is_ssh_session() || !self.environment.has_graphical_display() {
+                if self.is_headless() {
                     ElevationStrategy::Sudo
                 } else {
                     ElevationStrategy::MacOsOsascript
                 }
             }
             "linux" => {
-                // If in headless SSH session or lacking graphical display, sudo is strictly required
-                if self.environment.is_ssh_session() || !self.environment.has_graphical_display() {
+                if self.is_headless() {
                     ElevationStrategy::Sudo
                 } else if self.environment.is_udisks2_available() {
                     ElevationStrategy::UDisks2
@@ -531,11 +528,12 @@ impl PrivilegeManager {
                     ElevationStrategy::PolkitPkexec
                 }
             }
-            _ => {
-                // Default fallback for other Unix/POSIX environments: recommend sudo
-                ElevationStrategy::Sudo
-            }
+            _ => ElevationStrategy::Sudo,
         }
+    }
+
+    fn is_headless(&self) -> bool {
+        self.environment.is_ssh_session() || !self.environment.has_graphical_display()
     }
 
     /// Generates a platform-appropriate elevation command if elevation is required.
