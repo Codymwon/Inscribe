@@ -133,8 +133,19 @@ pub fn open_decompressor<R: Read + Send + 'static>(
                     let is_dir = zip_file.is_dir() || name.ends_with('/');
                     let is_macos_meta = name.contains("__macosx")
                         || name.split('/').any(|seg| seg.starts_with("._"));
+                    let is_doc = name.ends_with(".txt")
+                        || name.ends_with(".md")
+                        || name.ends_with(".nfo")
+                        || name.ends_with(".pdf")
+                        || name.ends_with(".html")
+                        || name.ends_with(".htm")
+                        || name.ends_with(".json")
+                        || name.ends_with(".xml")
+                        || name.ends_with(".yaml")
+                        || name.ends_with(".yml")
+                        || name.ends_with(".rtf");
 
-                    if is_dir || is_macos_meta {
+                    if is_dir || is_macos_meta || is_doc {
                         // Dropping zip_file advances reader past entry payload
                         continue;
                     }

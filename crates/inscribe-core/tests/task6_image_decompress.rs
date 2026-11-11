@@ -462,3 +462,58 @@ fn test_inspect_gzip_greater_than_4gib_falls_back_to_indeterminate() {
         "Normal Gzip under 4 GiB must return Some(isize)"
     );
 }
+
+#[test]
+fn test_zip_decompressor_selects_image_file_over_preceding_documentation() {
+    use zip::ZipWriter;
+    use zip::write::SimpleFileOptions;
+
+    let mut cursor = Cursor::new(Vec::new());
+    let mut zip = ZipWriter::new(&mut cursor);
+
+    // Entry 1: Documentation text file (README)
+    zip.start_file("README.txt", SimpleFileOptions::default())
+        .expect("add README failed");
+    zip.write_all(b"Please read this readme file before using the disk image.")
+        .expect("write failed");
+
+    // Entry 2: License text file
+    zip.start_file("LICENSE.txt", SimpleFileOptions::default())
+        .expect("add LICENSE failed");
+    zip.write_all(b"Apache License 2.0").expect("write failed");
+
+    // Entry 3: Actual OS disk image payload
+    let real_disk_image = b"RAW_DISK_IMAGE_PAYLOAD_FOR_USB_FLASHING_TEST";
+    zip.start_file("distro/os.img", SimpleFileOptions::default())
+        .expect("add os.img failed");
+    zip.write_all(real_disk_image).expect("write failed");
+
+    zip.finish().expect("zip finish failed");
+    let zip_bytes = cursor.into_inner();
+
+    // 1. Seekable decompressor (used by CLI flash)
+    let mut seekable_decompressor =
+        open_seekable_decompressor(Cursor::new(zip_bytes.clone()), ImageFormat::Zip)
+            .expect("open_seekable_decompressor failed");
+    let mut seekable_output = Vec::new();
+    seekable_decompressor
+        .read_to_end(&mut seekable_output)
+        .expect("read seekable failed");
+    assert_eq!(
+        seekable_output, real_disk_image,
+        "Seekable ZIP decompressor must select os.img rather than preceding README.txt"
+    );
+
+    // 2. Non-seekable stream decompressor
+    let non_seekable = NonSeekableStream(Cursor::new(zip_bytes));
+    let mut stream_decompressor =
+        open_decompressor(non_seekable, ImageFormat::Zip).expect("open_decompressor failed");
+    let mut stream_output = Vec::new();
+    stream_decompressor
+        .read_to_end(&mut stream_output)
+        .expect("read stream failed");
+    assert_eq!(
+        stream_output, real_disk_image,
+        "Sequential streaming ZIP decompressor must skip preceding documentation files to select disk image"
+    );
+}
