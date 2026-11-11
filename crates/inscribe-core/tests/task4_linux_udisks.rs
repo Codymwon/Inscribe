@@ -57,7 +57,7 @@ async fn test_drive_guard_blocks_unmount_and_open_on_system_drive() {
         mount_points: vec![PathBuf::from("/")],
     };
 
-    let res = client.unmount_and_open(&system_drive, true).await;
+    let res = client.unmount_and_open(&system_drive, true, false).await;
     assert!(
         res.is_err(),
         "Drive Guard must reject flashing system drive before opening via UDisks2"
@@ -88,7 +88,7 @@ async fn test_drive_guard_blocks_unmount_and_open_on_internal_nvme() {
         mount_points: vec![],
     };
 
-    let res = client.unmount_and_open(&internal_nvme, true).await;
+    let res = client.unmount_and_open(&internal_nvme, true, false).await;
     assert!(
         res.is_err(),
         "Drive Guard must reject non-removable internal NVMe storage"
@@ -116,4 +116,132 @@ async fn test_live_udisks_block_device_proxy_inspection() {
             }
         }
     }
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn test_canonical_partition_matcher() {
+    use inscribe_core::drive::linux::is_partition_of;
+
+    // SCSI / SATA / USB drive naming (letter-based)
+    assert!(is_partition_of(
+        Path::new("/dev/sdb"),
+        Path::new("/dev/sdb1")
+    ));
+    assert!(is_partition_of(
+        Path::new("/dev/sdb"),
+        Path::new("/dev/sdb2")
+    ));
+    assert!(is_partition_of(
+        Path::new("/dev/sdb"),
+        Path::new("/dev/sdb15")
+    ));
+    assert!(!is_partition_of(
+        Path::new("/dev/sdb"),
+        Path::new("/dev/sdb")
+    ));
+    assert!(!is_partition_of(
+        Path::new("/dev/sdb"),
+        Path::new("/dev/sdc1")
+    ));
+    assert!(!is_partition_of(
+        Path::new("/dev/sdb"),
+        Path::new("/dev/sdbp1")
+    ));
+    assert!(!is_partition_of(
+        Path::new("/dev/sdb"),
+        Path::new("/dev/sdb_1")
+    ));
+
+    // NVMe / eMMC / Loop drive naming (digit-based)
+    assert!(is_partition_of(
+        Path::new("/dev/nvme0n1"),
+        Path::new("/dev/nvme0n1p1")
+    ));
+    assert!(is_partition_of(
+        Path::new("/dev/nvme0n1"),
+        Path::new("/dev/nvme0n1p12")
+    ));
+    assert!(!is_partition_of(
+        Path::new("/dev/nvme0n1"),
+        Path::new("/dev/nvme0n1")
+    ));
+    assert!(!is_partition_of(
+        Path::new("/dev/nvme0n1"),
+        Path::new("/dev/nvme0n11")
+    ));
+    assert!(!is_partition_of(
+        Path::new("/dev/nvme0n1"),
+        Path::new("/dev/nvme0n10")
+    ));
+    assert!(!is_partition_of(
+        Path::new("/dev/nvme0n1"),
+        Path::new("/dev/nvme0n1p")
+    ));
+
+    // eMMC / MMCBLK naming
+    assert!(is_partition_of(
+        Path::new("/dev/mmcblk0"),
+        Path::new("/dev/mmcblk0p1")
+    ));
+    assert!(!is_partition_of(
+        Path::new("/dev/mmcblk0"),
+        Path::new("/dev/mmcblk1p1")
+    ));
+
+    // Different parent directories should not match
+    assert!(!is_partition_of(
+        Path::new("/dev/sdb"),
+        Path::new("/tmp/sdb1")
+    ));
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn test_udisks_symlink_canonicalization() {
+    let temp_dir = std::env::temp_dir().join(format!("inscribe_test_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let target_dev = temp_dir.join("sdb");
+    let _ = std::fs::write(&target_dev, b"");
+    let symlink_path = temp_dir.join("by-id-usb-test-drive");
+    let _ = std::os::unix::fs::symlink(&target_dev, &symlink_path);
+
+    let obj = dev_path_to_object_path(&symlink_path).expect("Must resolve symlink");
+    assert_eq!(obj.as_str(), "/org/freedesktop/UDisks2/block_devices/sdb");
+
+    let _ = std::fs::remove_file(&symlink_path);
+    let _ = std::fs::remove_file(&target_dev);
+    let _ = std::fs::remove_dir(&temp_dir);
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn test_unmount_and_open_external_usb_ssd_opt_in() {
+    let client = match UDisksClient::new().await {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Skipping live D-Bus test: system bus unavailable: {e}");
+            return;
+        }
+    };
+
+    let usb_ssd = DriveInfo {
+        path: PathBuf::from("/dev/sdz"),
+        model: "External Portable SSD".to_string(),
+        vendor: "Samsung".to_string(),
+        size: 500_000_000_000,
+        sector_size: 512,
+        bus_type: BusType::Usb,
+        is_removable: false,
+        is_read_only: false,
+        is_system: false,
+        mount_points: vec![],
+    };
+
+    // Without opt-in (allow_external_usb_ssd = false), must fail DriveGuard
+    let res = client.unmount_and_open(&usb_ssd, true, false).await;
+    assert!(
+        res.is_err(),
+        "Must be blocked when allow_external_usb_ssd is false"
+    );
 }

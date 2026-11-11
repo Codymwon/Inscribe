@@ -98,6 +98,48 @@ impl LinuxDriveScanner {
     }
 }
 
+/// Determines if `candidate` represents a valid partition path of `disk`.
+///
+/// Linux kernel naming conventions:
+/// - If base device name ends in an ASCII digit (e.g. `nvme0n1`, `mmcblk0`, `loop0`),
+///   partitions must start with 'p' followed by ASCII digits (`p1`, `p2`).
+/// - If base device name ends in an ASCII non-digit (e.g. `sda`, `sdb`, `vdc`),
+///   partitions must be ASCII digits directly (`1`, `2`).
+#[must_use]
+pub fn is_partition_of(disk: &Path, candidate: &Path) -> bool {
+    // If parents exist, they should match (e.g. both in /dev)
+    if disk.parent() != candidate.parent() {
+        return false;
+    }
+
+    let Some(disk_name) = disk.file_name().and_then(|f| f.to_str()) else {
+        return false;
+    };
+    let Some(cand_name) = candidate.file_name().and_then(|f| f.to_str()) else {
+        return false;
+    };
+
+    if !cand_name.starts_with(disk_name) {
+        return false;
+    }
+
+    let suffix = &cand_name[disk_name.len()..];
+    if suffix.is_empty() {
+        return false;
+    }
+
+    let disk_ends_with_digit = disk_name.chars().last().is_some_and(|c| c.is_ascii_digit());
+    if disk_ends_with_digit {
+        if let Some(rest) = suffix.strip_prefix('p') {
+            !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit())
+        } else {
+            false
+        }
+    } else {
+        suffix.chars().all(|c| c.is_ascii_digit())
+    }
+}
+
 /// Decodes octal escape sequences in `/proc/mounts` (e.g. `\040` -> `' '`).
 fn unescape_octal(input: &str) -> String {
     let mut result = String::with_capacity(input.len());
@@ -210,16 +252,9 @@ impl DriveScanner for LinuxDriveScanner {
             let mut drive_mount_points = Vec::new();
 
             for (mounted_dev, mount_list) in &mounts_map {
-                let mounted_str = mounted_dev.to_string_lossy();
-                let dev_node_str = dev_node_path.to_string_lossy();
-
                 // Match exact disk (/dev/sdb) or partition (/dev/sdb1, /dev/nvme0n1p2)
-                let is_match = mounted_str == dev_node_str
-                    || (mounted_str.starts_with(&*dev_node_str)
-                        && mounted_str[dev_node_str.len()..]
-                            .chars()
-                            .next()
-                            .is_some_and(|c| c.is_ascii_digit() || c == 'p'));
+                let is_match =
+                    mounted_dev == &dev_node_path || is_partition_of(&dev_node_path, mounted_dev);
 
                 if is_match {
                     for mount in mount_list {

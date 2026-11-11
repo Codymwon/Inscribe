@@ -6,7 +6,7 @@
 
 use crate::drive::DriveInfo;
 use crate::drive::guard::DriveGuard;
-use crate::drive::linux::LinuxDriveScanner;
+use crate::drive::linux::{LinuxDriveScanner, is_partition_of};
 use crate::error::InscribeError;
 use std::collections::HashMap;
 use std::os::fd::OwnedFd;
@@ -15,12 +15,16 @@ use zbus::zvariant::{OwnedObjectPath, Value};
 
 /// Generates the UDisks2 D-Bus object path for a given block device path.
 ///
+/// Canonicalizes symlinks (e.g. `/dev/disk/by-id/...` -> `/dev/sda`) to match UDisks2
+/// object path conventions (`/org/freedesktop/UDisks2/block_devices/<node>`).
+///
 /// # Errors
 ///
 /// Returns `InscribeError::DeviceNotFound` if the path has no valid file name,
 /// or `InscribeError::UDisks` if the resulting D-Bus path is invalid.
 pub fn dev_path_to_object_path(path: &Path) -> Result<OwnedObjectPath, InscribeError> {
-    let file_name = path
+    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let file_name = resolved
         .file_name()
         .and_then(|f| f.to_str())
         .ok_or_else(|| InscribeError::DeviceNotFound(path.display().to_string()))?;
@@ -164,8 +168,13 @@ impl UDisksClient {
             Ok(()) => Ok(()),
             Err(e) => {
                 let err_str = e.to_string();
-                // Treat "not mounted" as success since target is already unmounted
-                if err_str.contains("NotMounted") || err_str.contains("not mounted") {
+                if err_str.contains("NotAuthorized") {
+                    Err(InscribeError::PrivilegeRequired(format!(
+                        "Privilege required to unmount {}: {err_str}",
+                        partition_path.display()
+                    )))
+                } else if err_str.contains("NotMounted") || err_str.contains("not mounted") {
+                    // Treat "not mounted" as success since target is already unmounted
                     Ok(())
                 } else {
                     Err(InscribeError::UDisks(format!(
@@ -183,7 +192,8 @@ impl UDisksClient {
     ///
     /// # Errors
     ///
-    /// Returns `InscribeError::UDisks` or `InscribeError::DeviceNotFound`.
+    /// Returns `InscribeError::PrivilegeRequired` if Polkit authorization is denied,
+    /// or `InscribeError::UDisks` / `InscribeError::DeviceNotFound`.
     pub async fn open_block_device(
         &self,
         dev_path: &Path,
@@ -200,7 +210,18 @@ impl UDisksClient {
         }
 
         let zfd = proxy.open_device(mode, options).await.map_err(|e| {
-            InscribeError::UDisks(format!("OpenDevice failed for {}: {e}", dev_path.display()))
+            let err_str = e.to_string();
+            if err_str.contains("NotAuthorized") {
+                InscribeError::PrivilegeRequired(format!(
+                    "Privilege required to open block device {}: {err_str}",
+                    dev_path.display()
+                ))
+            } else {
+                InscribeError::UDisks(format!(
+                    "OpenDevice failed for {}: {err_str}",
+                    dev_path.display()
+                ))
+            }
         })?;
 
         Ok(OwnedFd::from(zfd))
@@ -208,32 +229,27 @@ impl UDisksClient {
 
     /// Safely validates with Drive Guard, unmounts active partitions, and acquires a raw block file descriptor.
     ///
+    /// Fails fast if any partition unmount operation fails, preventing raw block access on active mounts.
+    ///
     /// # Errors
     ///
     /// Returns `InscribeError::DriveGuardViolation` if target is rejected by Drive Guard,
-    /// or `InscribeError::UDisks` if D-Bus communication fails.
+    /// `InscribeError::PrivilegeRequired` if Polkit authorization fails,
+    /// or `InscribeError::UDisks` if D-Bus communication or unmounting fails.
     pub async fn unmount_and_open(
         &self,
         drive: &DriveInfo,
         direct: bool,
+        allow_external_usb_ssd: bool,
     ) -> Result<OwnedFd, InscribeError> {
         // Enforce Drive Guard safety gate before touching any partition or block device
-        DriveGuard::validate_target(drive)?;
+        DriveGuard::validate_target_with_options(drive, allow_external_usb_ssd)?;
 
         // Query active mounts from /proc/mounts to find partitions associated with this drive
         if let Ok(mounts) = LinuxDriveScanner::parse_mounts(Path::new("/proc/mounts")) {
-            let dev_str = drive.path.to_string_lossy();
             for (mounted_dev, _) in mounts {
-                let mounted_str = mounted_dev.to_string_lossy();
-                let is_match = mounted_str == dev_str
-                    || (mounted_str.starts_with(&*dev_str)
-                        && mounted_str[dev_str.len()..]
-                            .chars()
-                            .next()
-                            .is_some_and(|c| c.is_ascii_digit() || c == 'p'));
-
-                if is_match {
-                    let _ = self.unmount_partition(&mounted_dev).await;
+                if mounted_dev == drive.path || is_partition_of(&drive.path, &mounted_dev) {
+                    self.unmount_partition(&mounted_dev).await?;
                 }
             }
         }
