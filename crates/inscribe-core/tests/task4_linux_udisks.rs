@@ -245,3 +245,41 @@ async fn test_unmount_and_open_external_usb_ssd_opt_in() {
         "Must be blocked when allow_external_usb_ssd is false"
     );
 }
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn test_udisks_unmount_and_open_attestation_detects_swapped_device() {
+    let client = match UDisksClient::new().await {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Skipping live D-Bus test: system bus unavailable: {e}");
+            return;
+        }
+    };
+
+    let scan_drive = DriveInfo {
+        path: PathBuf::from("/dev/sdz"),
+        model: "USB Flash".to_string(),
+        vendor: "SanDisk".to_string(),
+        size: 32_000_000_000,
+        sector_size: 512,
+        bus_type: BusType::Usb,
+        is_removable: true,
+        is_read_only: false,
+        is_system: false,
+        mount_points: vec![],
+    };
+
+    // Live mock scanner where device was swapped to an internal NVMe drive with same path
+    let mut swapped_live = scan_drive.clone();
+    swapped_live.bus_type = BusType::Nvme;
+    let mock_scanner = inscribe_core::drive::MockDriveScanner::new(vec![swapped_live]);
+
+    let res = client
+        .unmount_and_open_with_scanner(&scan_drive, true, false, Some(&mock_scanner))
+        .await;
+    assert!(
+        res.is_err(),
+        "Live target attestation must block flash when device was swapped"
+    );
+}

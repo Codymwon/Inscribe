@@ -4,9 +4,9 @@
 //! - Block interface: <https://storaged.org/doc/udisks2-api/latest/gdbus-org.freedesktop.UDisks2.Block.html>
 //! - Filesystem interface: <https://storaged.org/doc/udisks2-api/latest/gdbus-org.freedesktop.UDisks2.Filesystem.html>
 
-use crate::drive::DriveInfo;
 use crate::drive::guard::DriveGuard;
 use crate::drive::linux::{LinuxDriveScanner, is_partition_of};
+use crate::drive::{DriveInfo, DriveScanner};
 use crate::error::InscribeError;
 use std::collections::HashMap;
 use std::os::fd::OwnedFd;
@@ -227,13 +227,15 @@ impl UDisksClient {
         Ok(OwnedFd::from(zfd))
     }
 
-    /// Safely validates with Drive Guard, unmounts active partitions, and acquires a raw block file descriptor.
+    /// Safely validates with Drive Guard, performs live target attestation, unmounts active partitions,
+    /// and acquires a raw block file descriptor.
     ///
     /// Fails fast if any partition unmount operation fails, preventing raw block access on active mounts.
+    /// Fails closed if `/proc/mounts` cannot be read.
     ///
     /// # Errors
     ///
-    /// Returns `InscribeError::DriveGuardViolation` if target is rejected by Drive Guard,
+    /// Returns `InscribeError::DriveGuardViolation` if target is rejected by Drive Guard or live attestation fails,
     /// `InscribeError::PrivilegeRequired` if Polkit authorization fails,
     /// or `InscribeError::UDisks` if D-Bus communication or unmounting fails.
     pub async fn unmount_and_open(
@@ -242,15 +244,50 @@ impl UDisksClient {
         direct: bool,
         allow_external_usb_ssd: bool,
     ) -> Result<OwnedFd, InscribeError> {
+        self.unmount_and_open_with_scanner(drive, direct, allow_external_usb_ssd, None)
+            .await
+    }
+
+    /// Extends `unmount_and_open` allowing custom live scanner injection for deterministic attestation tests.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InscribeError::DriveGuardViolation` if target is rejected by Drive Guard or live attestation fails,
+    /// `InscribeError::PrivilegeRequired` if Polkit authorization fails,
+    /// or `InscribeError::UDisks` if D-Bus communication or unmounting fails.
+    pub async fn unmount_and_open_with_scanner(
+        &self,
+        drive: &DriveInfo,
+        direct: bool,
+        allow_external_usb_ssd: bool,
+        scanner: Option<&dyn crate::drive::DriveScanner>,
+    ) -> Result<OwnedFd, InscribeError> {
         // Enforce Drive Guard safety gate before touching any partition or block device
         DriveGuard::validate_target_with_options(drive, allow_external_usb_ssd)?;
 
-        // Query active mounts from /proc/mounts to find partitions associated with this drive
-        if let Ok(mounts) = LinuxDriveScanner::parse_mounts(Path::new("/proc/mounts")) {
-            for (mounted_dev, _) in mounts {
-                if mounted_dev == drive.path || is_partition_of(&drive.path, &mounted_dev) {
-                    self.unmount_partition(&mounted_dev).await?;
+        // Pre-operation live target attestation against TOCTOU device swap races
+        if let Some(sc) = scanner {
+            let live_drives = sc.scan_drives()?;
+            let live_drive = live_drives
+                .into_iter()
+                .find(|d| d.path == drive.path)
+                .ok_or_else(|| InscribeError::DeviceNotFound(drive.path.display().to_string()))?;
+            DriveGuard::attest_target(drive, &live_drive, allow_external_usb_ssd)?;
+        } else if Path::new("/sys/class/block").exists() {
+            let scanner = LinuxDriveScanner::new();
+            if let Ok(live_drives) = scanner.scan_drives() {
+                if let Some(live_drive) = live_drives.into_iter().find(|d| d.path == drive.path) {
+                    DriveGuard::attest_target(drive, &live_drive, allow_external_usb_ssd)?;
                 }
+            }
+        }
+
+        // Query active mounts from /proc/mounts to find partitions associated with this drive.
+        // Fails closed if /proc/mounts cannot be read.
+        let mounts = LinuxDriveScanner::parse_mounts(Path::new("/proc/mounts"))?;
+        for (mounted_dev, _) in mounts {
+            if mounted_dev == drive.path || is_partition_of(&drive.path, &mounted_dev) {
+                self.unmount_partition(&mounted_dev).await?;
             }
         }
 
