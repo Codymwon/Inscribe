@@ -101,23 +101,17 @@ impl BlockTarget for MultiBlockTarget {
 
         let mut min_capacity = u64::MAX;
         for target in &self.targets {
-            let cap = target.capacity()?;
-            if cap < min_capacity {
-                min_capacity = cap;
-            }
+            min_capacity = min_capacity.min(target.capacity()?);
         }
         Ok(min_capacity)
     }
 
     fn block_size(&self) -> u32 {
-        let mut max_block_size = 512;
-        for target in &self.targets {
-            let bs = target.block_size();
-            if bs > max_block_size {
-                max_block_size = bs;
-            }
-        }
-        max_block_size
+        self.targets
+            .iter()
+            .map(|t| t.block_size())
+            .max()
+            .unwrap_or(512)
     }
 
     fn write_block(&mut self, offset: u64, data: &[u8]) -> Result<(), InscribeError> {

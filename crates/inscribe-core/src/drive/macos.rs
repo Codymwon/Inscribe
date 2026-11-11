@@ -34,11 +34,7 @@ pub const DADISK_CLAIM_OPTION_DEFAULT: u32 = 0x0000_0000;
 #[must_use]
 pub fn to_raw_character_device(dev_path: &Path) -> PathBuf {
     let s = dev_path.to_string_lossy();
-    let name = if let Some(stripped) = s.strip_prefix("/dev/") {
-        stripped
-    } else {
-        &s
-    };
+    let name = s.strip_prefix("/dev/").unwrap_or(&s);
 
     if let Some(stripped) = name.strip_prefix("disk") {
         PathBuf::from(format!("/dev/rdisk{stripped}"))
@@ -51,11 +47,7 @@ pub fn to_raw_character_device(dev_path: &Path) -> PathBuf {
 #[must_use]
 pub fn to_block_device(dev_path: &Path) -> PathBuf {
     let s = dev_path.to_string_lossy();
-    let name = if let Some(stripped) = s.strip_prefix("/dev/") {
-        stripped
-    } else {
-        &s
-    };
+    let name = s.strip_prefix("/dev/").unwrap_or(&s);
 
     if let Some(stripped) = name.strip_prefix("rdisk") {
         PathBuf::from(format!("/dev/disk{stripped}"))
@@ -68,11 +60,7 @@ pub fn to_block_device(dev_path: &Path) -> PathBuf {
 #[must_use]
 pub fn bsd_name(dev_path: &Path) -> String {
     let s = dev_path.to_string_lossy();
-    let name = if let Some(stripped) = s.strip_prefix("/dev/") {
-        stripped
-    } else {
-        &s
-    };
+    let name = s.strip_prefix("/dev/").unwrap_or(&s);
 
     if let Some(stripped) = name.strip_prefix("rdisk") {
         format!("disk{stripped}")

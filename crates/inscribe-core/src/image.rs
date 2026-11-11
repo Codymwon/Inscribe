@@ -85,6 +85,6 @@ impl ImageMetadata {
     /// Effective write payload size (uncompressed size if known, otherwise compressed size fallback).
     #[must_use]
     pub fn payload_size(&self) -> Option<u64> {
-        self.uncompressed_size.or(Some(self.file_size))
+        Some(self.uncompressed_size.unwrap_or(self.file_size))
     }
 }

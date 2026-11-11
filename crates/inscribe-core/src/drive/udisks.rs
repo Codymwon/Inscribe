@@ -33,13 +33,7 @@ pub fn dev_path_to_object_path(path: &Path) -> Result<OwnedObjectPath, InscribeE
     // Characters outside [A-Za-z0-9_] are converted to '_' for valid D-Bus object path semantics.
     let sanitized: String = file_name
         .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect();
 
     let path_str = format!("/org/freedesktop/UDisks2/block_devices/{sanitized}");

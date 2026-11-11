@@ -276,37 +276,23 @@ impl StorageDeviceDescriptor {
             )));
         }
 
-        let raw_size = u32::from_le_bytes(
-            buffer[4..8]
-                .try_into()
-                .map_err(|e| InscribeError::Other(format!("Failed to read size: {e}")))?,
-        );
+        let read_u32 = |offset: usize| {
+            u32::from_le_bytes([
+                buffer[offset],
+                buffer[offset + 1],
+                buffer[offset + 2],
+                buffer[offset + 3],
+            ])
+        };
+
+        let raw_size = read_u32(4);
         let removable_media = buffer[10] != 0;
         let command_queueing = buffer[11] != 0;
-
-        let vendor_id_offset = u32::from_le_bytes(
-            buffer[12..16]
-                .try_into()
-                .map_err(|e| InscribeError::Other(format!("Failed to read vendor offset: {e}")))?,
-        );
-        let product_id_offset =
-            u32::from_le_bytes(buffer[16..20].try_into().map_err(|e| {
-                InscribeError::Other(format!("Failed to read product offset: {e}"))
-            })?);
-        let product_revision_offset =
-            u32::from_le_bytes(buffer[20..24].try_into().map_err(|e| {
-                InscribeError::Other(format!("Failed to read revision offset: {e}"))
-            })?);
-        let serial_number_offset = u32::from_le_bytes(
-            buffer[24..28]
-                .try_into()
-                .map_err(|e| InscribeError::Other(format!("Failed to read serial offset: {e}")))?,
-        );
-        let bus_type_raw = u32::from_le_bytes(
-            buffer[28..32]
-                .try_into()
-                .map_err(|e| InscribeError::Other(format!("Failed to read bus type: {e}")))?,
-        );
+        let vendor_id_offset = read_u32(12);
+        let product_id_offset = read_u32(16);
+        let product_revision_offset = read_u32(20);
+        let serial_number_offset = read_u32(24);
+        let bus_type_raw = read_u32(28);
 
         let vendor = extract_string_at_offset(buffer, vendor_id_offset);
         let product = extract_string_at_offset(buffer, product_id_offset);
@@ -355,13 +341,11 @@ pub fn volume_path(drive_letter: char) -> PathBuf {
 /// Parses the physical drive index from paths like `\\.\PhysicalDrive3`.
 #[must_use]
 pub fn parse_physical_drive_index(path: &Path) -> Option<u32> {
-    let s = path.to_string_lossy();
-    let normalized = s.replace('/', "\\");
-    let prefix = r"\\.\physicaldrive";
+    let s = path.to_string_lossy().replace('/', "\\");
+    const PREFIX: &str = r"\\.\PhysicalDrive";
 
-    if normalized.to_ascii_lowercase().starts_with(prefix) {
-        let suffix = &normalized[prefix.len()..];
-        suffix.parse::<u32>().ok()
+    if s.len() >= PREFIX.len() && s[..PREFIX.len()].eq_ignore_ascii_case(PREFIX) {
+        s[PREFIX.len()..].parse::<u32>().ok()
     } else {
         None
     }
@@ -441,14 +425,13 @@ pub fn normalize_volume_path(mount: &Path) -> PathBuf {
         PathBuf::from(trimmed)
     } else if let Some(rest) = trimmed.strip_prefix(r"\\?\") {
         PathBuf::from(format!(r"\\.\{rest}"))
-    } else if let Some(first_char) = trimmed.chars().next() {
-        if first_char.is_ascii_alphabetic() && trimmed.chars().nth(1) == Some(':') {
-            volume_path(first_char)
+    } else {
+        let bytes = trimmed.as_bytes();
+        if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+            volume_path(bytes[0] as char)
         } else {
             PathBuf::from(format!(r"\\.\{trimmed}"))
         }
-    } else {
-        PathBuf::from(trimmed)
     }
 }
 
@@ -679,10 +662,11 @@ impl WindowsVolumeLockSequence {
             executor.execute_step(step)?;
         }
 
-        let mut retained_handles = Vec::with_capacity(volume_paths.len() + 1);
-        for vol in &volume_paths {
-            retained_handles.push(RetainedLockHandle::new(vol.clone()));
-        }
+        let mut retained_handles: Vec<_> = volume_paths
+            .iter()
+            .cloned()
+            .map(RetainedLockHandle::new)
+            .collect();
         retained_handles.push(RetainedLockHandle::new(drive.path.clone()));
 
         Ok(WindowsVolumeLock {

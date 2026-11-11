@@ -256,63 +256,41 @@ pub fn is_system_mount(mount: &Path) -> bool {
     let mount_str = mount.to_string_lossy();
     let mount_trimmed = mount_str.trim();
 
-    // Linux / Unix root and core system directories
     if mount_trimmed == "/" {
         return true;
     }
 
-    if mount_trimmed == "/boot" || mount_trimmed.starts_with("/boot/") {
-        return true;
+    // Standard Unix / macOS system directories
+    const SYSTEM_DIRECTORIES: &[&str] = &[
+        "/boot",
+        "/home",
+        "/etc",
+        "/usr",
+        "/var",
+        "/root",
+        "/System",
+        "/Volumes/Macintosh HD",
+        "/private",
+    ];
+
+    for &dir in SYSTEM_DIRECTORIES {
+        if mount_trimmed == dir
+            || mount_trimmed
+                .strip_prefix(dir)
+                .is_some_and(|rest| rest.starts_with('/'))
+        {
+            return true;
+        }
     }
 
-    if mount_trimmed == "/home" || mount_trimmed.starts_with("/home/") {
-        return true;
-    }
-
-    if mount_trimmed == "/etc" || mount_trimmed.starts_with("/etc/") {
-        return true;
-    }
-
-    if mount_trimmed == "/usr" || mount_trimmed.starts_with("/usr/") {
-        return true;
-    }
-
-    if mount_trimmed == "/var" || mount_trimmed.starts_with("/var/") {
-        return true;
-    }
-
-    if mount_trimmed == "/root" || mount_trimmed.starts_with("/root/") {
-        return true;
-    }
-
-    // Windows system drive (case-insensitive check for C:, C:\, C:/)
+    // Windows system drive (case-insensitive check for C:, C:\..., C:/...)
     let upper = mount_trimmed.to_ascii_uppercase();
-    if upper == "C:" || upper == "C:\\" || upper == "C:/" {
-        return true;
-    }
-    if upper.starts_with("C:\\") || upper.starts_with("C:/") {
-        return true;
-    }
-
-    // macOS system volumes
-    if mount_trimmed == "/System" || mount_trimmed.starts_with("/System/") {
-        return true;
-    }
-    if mount_trimmed == "/Volumes/Macintosh HD"
-        || mount_trimmed.starts_with("/Volumes/Macintosh HD/")
-    {
-        return true;
-    }
-    if mount_trimmed == "/private" || mount_trimmed.starts_with("/private/") {
+    if upper == "C:" || upper.starts_with("C:\\") || upper.starts_with("C:/") {
         return true;
     }
 
     // Active Linux / Unix swap space
-    if mount_trimmed == "[SWAP]" || mount_trimmed.eq_ignore_ascii_case("swap") {
-        return true;
-    }
-
-    false
+    mount_trimmed == "[SWAP]" || mount_trimmed.eq_ignore_ascii_case("swap")
 }
 
 /// Predicate checking if a device path represents a partition or volume rather than a whole block device.
@@ -328,32 +306,19 @@ pub fn is_partition_path(path: &Path) -> bool {
     }
     // Drive letters: E:, \\.\E:, C:\, etc.
     let upper = trimmed.to_ascii_uppercase();
-    if (upper.len() >= 2
-        && upper.chars().nth(1) == Some(':')
-        && upper
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_alphabetic()))
-        || (upper.starts_with(r"\\.\")
-            && upper.len() >= 6
-            && upper.chars().nth(5) == Some(':')
-            && upper
-                .chars()
-                .nth(4)
-                .is_some_and(|c| c.is_ascii_alphabetic()))
+    let stripped = upper.strip_prefix(r"\\.\").unwrap_or(&upper);
+    if stripped.len() >= 2
+        && stripped.as_bytes()[0].is_ascii_alphabetic()
+        && stripped.as_bytes()[1] == b':'
     {
         return true;
     }
 
-    // macOS checks:
-    // /dev/disk2s1 or /dev/rdisk2s1
+    // macOS checks: /dev/disk2s1 or /dev/rdisk2s1
     let file_name = path.file_name().and_then(|f| f.to_str()).unwrap_or("");
-    if (file_name.starts_with("disk") || file_name.starts_with("rdisk")) && file_name.contains('s')
-    {
-        let base = file_name
-            .strip_prefix("rdisk")
-            .unwrap_or_else(|| file_name.strip_prefix("disk").unwrap_or(""));
-        if let Some((_disk_idx, part_idx)) = base.split_once('s') {
+    let disk_part = file_name.strip_prefix('r').unwrap_or(file_name);
+    if let Some(rest) = disk_part.strip_prefix("disk") {
+        if let Some((_disk_idx, part_idx)) = rest.split_once('s') {
             if !part_idx.is_empty() && part_idx.chars().all(|c| c.is_ascii_digit()) {
                 return true;
             }
@@ -362,8 +327,7 @@ pub fn is_partition_path(path: &Path) -> bool {
 
     // Linux checks:
     // /dev/sdb1, /dev/hda2, /dev/vda1, /dev/nvme0n1p1, /dev/mmcblk0p1, /dev/loop0p1
-    if trimmed.starts_with("/dev/") {
-        let dev = trimmed.strip_prefix("/dev/").unwrap_or("");
+    if let Some(dev) = trimmed.strip_prefix("/dev/") {
         // SCSI/SATA/USB (sd), IDE (hd), VirtIO (vd), Xen (xvd)
         for prefix in &["sd", "hd", "vd", "xvd"] {
             if let Some(rest) = dev.strip_prefix(prefix) {
@@ -377,9 +341,7 @@ pub fn is_partition_path(path: &Path) -> bool {
         }
 
         // NVMe / MMC / Loop with 'p' separator: e.g. nvme0n1p1, mmcblk0p1
-        if let Some(pos) = dev.rfind('p') {
-            let (prefix, suffix) = dev.split_at(pos);
-            let part_num = &suffix[1..];
+        if let Some((prefix, part_num)) = dev.rsplit_once('p') {
             if !part_num.is_empty()
                 && part_num.chars().all(|c| c.is_ascii_digit())
                 && prefix.chars().last().is_some_and(|c| c.is_ascii_digit())

@@ -73,15 +73,12 @@ impl LinuxDriveScanner {
 
         let content = fs::read_to_string(mounts_file)?;
         for line in content.lines() {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 2 {
-                let spec = parts[0];
-                let mount = parts[1];
+            let mut parts = line.split_whitespace();
+            if let (Some(spec), Some(mount)) = (parts.next(), parts.next()) {
                 if spec.starts_with('/') {
                     let decoded_mount = unescape_octal(mount);
-                    let spec_path = Path::new(spec);
                     let resolved_spec =
-                        fs::canonicalize(spec_path).unwrap_or_else(|_| PathBuf::from(spec));
+                        fs::canonicalize(spec).unwrap_or_else(|_| PathBuf::from(spec));
                     map.entry(resolved_spec)
                         .or_default()
                         .push(PathBuf::from(decoded_mount));
@@ -108,8 +105,7 @@ impl LinuxDriveScanner {
             if trimmed.is_empty() || trimmed.starts_with("Filename") {
                 continue;
             }
-            let parts: Vec<&str> = trimmed.split_whitespace().collect();
-            if let Some(&dev_spec) = parts.first() {
+            if let Some(dev_spec) = trimmed.split_whitespace().next() {
                 if dev_spec.starts_with('/') {
                     let path = PathBuf::from(dev_spec);
                     let resolved = fs::canonicalize(&path).unwrap_or(path);
@@ -169,22 +165,18 @@ pub fn is_partition_of(disk: &Path, candidate: &Path) -> bool {
         return false;
     };
 
-    if !cand_name.starts_with(disk_name) {
+    let Some(suffix) = cand_name.strip_prefix(disk_name) else {
         return false;
-    }
-
-    let suffix = &cand_name[disk_name.len()..];
+    };
     if suffix.is_empty() {
         return false;
     }
 
     let disk_ends_with_digit = disk_name.chars().last().is_some_and(|c| c.is_ascii_digit());
     if disk_ends_with_digit {
-        if let Some(rest) = suffix.strip_prefix('p') {
-            !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit())
-        } else {
-            false
-        }
+        suffix
+            .strip_prefix('p')
+            .is_some_and(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()))
     } else {
         suffix.chars().all(|c| c.is_ascii_digit())
     }
@@ -193,34 +185,27 @@ pub fn is_partition_of(disk: &Path, candidate: &Path) -> bool {
 /// Decodes octal escape sequences in `/proc/mounts` (e.g. `\040` -> `' '`, `\303\251` -> `é`).
 #[must_use]
 pub fn unescape_octal(input: &str) -> String {
-    let mut raw_bytes = Vec::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
+    if !input.contains('\\') {
+        return input.to_string();
+    }
+    let bytes = input.as_bytes();
+    let mut raw_bytes = Vec::with_capacity(bytes.len());
+    let mut i = 0;
 
-    while let Some(c) = chars.next() {
-        if c == '\\' {
-            let mut octal = String::new();
-            for _ in 0..3 {
-                if let Some(&digit) = chars.peek() {
-                    if ('0'..='7').contains(&digit) {
-                        octal.push(digit);
-                        chars.next();
-                    } else {
-                        break;
-                    }
-                }
-            }
-            if octal.len() == 3 {
-                if let Ok(byte) = u8::from_str_radix(&octal, 8) {
-                    raw_bytes.push(byte);
-                    continue;
-                }
-            }
-            raw_bytes.push(b'\\');
-            raw_bytes.extend_from_slice(octal.as_bytes());
+    while i < bytes.len() {
+        if bytes[i] == b'\\'
+            && i + 3 < bytes.len()
+            && (b'0'..=b'7').contains(&bytes[i + 1])
+            && (b'0'..=b'7').contains(&bytes[i + 2])
+            && (b'0'..=b'7').contains(&bytes[i + 3])
+        {
+            let val =
+                ((bytes[i + 1] - b'0') << 6) | ((bytes[i + 2] - b'0') << 3) | (bytes[i + 3] - b'0');
+            raw_bytes.push(val);
+            i += 4;
         } else {
-            let mut buf = [0u8; 4];
-            let encoded = c.encode_utf8(&mut buf);
-            raw_bytes.extend_from_slice(encoded.as_bytes());
+            raw_bytes.push(bytes[i]);
+            i += 1;
         }
     }
     String::from_utf8_lossy(&raw_bytes).into_owned()
@@ -300,41 +285,33 @@ impl DriveScanner for LinuxDriveScanner {
                 continue;
             }
 
+            let read_trimmed = |sub: &str| {
+                fs::read_to_string(block_path.join(sub))
+                    .ok()
+                    .map(|s| s.trim().to_string())
+            };
+            let read_flag = |sub: &str| read_trimmed(sub).is_some_and(|s| s == "1");
+
             // Read sector count (512-byte units in Linux sysfs)
-            let size_str = fs::read_to_string(block_path.join("size")).unwrap_or_default();
-            let sectors: u64 = size_str.trim().parse().unwrap_or(0);
+            let sectors: u64 = read_trimmed("size")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
             let capacity_bytes = sectors.saturating_mul(512);
 
             // Read logical sector size
-            let sector_size: u32 = fs::read_to_string(block_path.join("queue/logical_block_size"))
-                .or_else(|_| fs::read_to_string(block_path.join("queue/hw_sector_size")))
-                .ok()
-                .and_then(|s| s.trim().parse().ok())
+            let sector_size: u32 = read_trimmed("queue/logical_block_size")
+                .or_else(|| read_trimmed("queue/hw_sector_size"))
+                .and_then(|s| s.parse().ok())
                 .unwrap_or(512);
 
-            // Read removable flag
-            let is_removable = fs::read_to_string(block_path.join("removable"))
-                .ok()
-                .map(|s| s.trim() == "1")
-                .unwrap_or(false);
-
-            // Read read-only flag
-            let is_read_only = fs::read_to_string(block_path.join("ro"))
-                .ok()
-                .map(|s| s.trim() == "1")
-                .unwrap_or(false);
+            let is_removable = read_flag("removable");
+            let is_read_only = read_flag("ro");
 
             // Device details
             let device_dir = block_path.join("device");
-            let vendor = fs::read_to_string(device_dir.join("vendor"))
-                .ok()
-                .map(|s| s.trim().to_string())
-                .unwrap_or_default();
-
-            let model = fs::read_to_string(device_dir.join("model"))
-                .or_else(|_| fs::read_to_string(device_dir.join("name")))
-                .ok()
-                .map(|s| s.trim().to_string())
+            let vendor = read_trimmed("device/vendor").unwrap_or_default();
+            let model = read_trimmed("device/model")
+                .or_else(|| read_trimmed("device/name"))
                 .unwrap_or_else(|| dev_name.to_string());
 
             // Determine bus type using canonicalized path of device or block node
