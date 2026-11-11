@@ -2,7 +2,7 @@
 
 use inscribe_core::drive::macos::{
     DADISK_CLAIM_OPTION_DEFAULT, DADISK_UNMOUNT_OPTION_FORCE, DADISK_UNMOUNT_OPTION_WHOLE,
-    MacDiskClaim, bsd_name, interconnect_to_bus_type, to_block_device,
+    MacDiskClaim, bsd_name, interconnect_to_bus_type, map_da_return, to_block_device,
     to_raw_character_device,
 };
 use inscribe_core::drive::windows::{
@@ -553,3 +553,63 @@ fn test_windows_volume_lock_sequence_attestation_detects_swapped_device() {
     );
 }
 
+#[test]
+fn test_macos_diskarbitration_error_mapping() {
+    let dev = Path::new("/dev/disk2");
+
+    // Success returns Ok(())
+    assert!(map_da_return(0, dev).is_ok());
+
+    // kDAReturnBusy (0xF8DA0002) maps to DeviceLockFailed
+    let busy_err = map_da_return(0xF8DA0002_u32 as i32, dev).unwrap_err();
+    match busy_err {
+        InscribeError::DeviceLockFailed { reason, .. } => {
+            assert!(reason.contains("kDAReturnBusy") || reason.contains("busy"));
+        }
+        other => panic!("Expected DeviceLockFailed, got {other:?}"),
+    }
+
+    // kDAReturnNotPermitted (0xF8DA0008) maps to PrivilegeRequired
+    let perm_err = map_da_return(0xF8DA0008_u32 as i32, dev).unwrap_err();
+    match perm_err {
+        InscribeError::PrivilegeRequired(msg) => {
+            assert!(msg.contains("kDAReturnNotPermitted") || msg.contains("not permitted"));
+        }
+        other => panic!("Expected PrivilegeRequired, got {other:?}"),
+    }
+
+    // kDAReturnNotPrivileged (0xF8DA0009) maps to PrivilegeRequired
+    let priv_err = map_da_return(0xF8DA0009_u32 as i32, dev).unwrap_err();
+    match priv_err {
+        InscribeError::PrivilegeRequired(msg) => {
+            assert!(msg.contains("kDAReturnNotPrivileged") || msg.contains("privilege"));
+        }
+        other => panic!("Expected PrivilegeRequired, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_macos_claim_sequence_attestation_detects_swapped_device() {
+    let scan_drive = DriveInfo {
+        path: PathBuf::from("/dev/disk3"),
+        model: "USB".to_string(),
+        vendor: "SanDisk".to_string(),
+        size: 32_000_000_000,
+        sector_size: 512,
+        bus_type: BusType::Usb,
+        is_removable: true,
+        is_read_only: false,
+        is_system: false,
+        mount_points: vec![],
+    };
+
+    let mut swapped_live = scan_drive.clone();
+    swapped_live.size = 1_000_000_000_000;
+
+    let res =
+        MacDiskClaim::claim_and_unmount_with_attestation(&scan_drive, Some(&swapped_live), false);
+    assert!(
+        res.is_err(),
+        "Live attestation must reject macOS claim when device capacity swapped"
+    );
+}

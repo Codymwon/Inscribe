@@ -99,6 +99,84 @@ pub fn interconnect_to_bus_type(protocol_str: &str) -> BusType {
     }
 }
 
+/// Maps a macOS DiskArbitration return code (`DAReturn` / `mach_error_t`) to strongly-typed `InscribeError`.
+///
+/// Official reference:
+/// - `kDAReturnBusy` = `0xF8DA0002`
+/// - `kDAReturnNotPermitted` = `0xF8DA0008`
+/// - `kDAReturnNotPrivileged` = `0xF8DA0009`
+///
+/// # Errors
+///
+/// Returns `InscribeError::DeviceLockFailed` on busy or general failure,
+/// or `InscribeError::PrivilegeRequired` if permission is denied.
+pub fn map_da_return(ret: i32, path: &Path) -> Result<(), InscribeError> {
+    const KDA_RETURN_SUCCESS: i32 = 0;
+    const KDA_RETURN_BUSY: i32 = 0xF8DA0002_u32 as i32;
+    const KDA_RETURN_NOT_PERMITTED: i32 = 0xF8DA0008_u32 as i32;
+    const KDA_RETURN_NOT_PRIVILEGED: i32 = 0xF8DA0009_u32 as i32;
+
+    match ret {
+        KDA_RETURN_SUCCESS => Ok(()),
+        KDA_RETURN_BUSY => Err(InscribeError::DeviceLockFailed {
+            path: path.display().to_string(),
+            reason: "DiskArbitration operation failed: disk or volume is busy (kDAReturnBusy)"
+                .to_string(),
+        }),
+        KDA_RETURN_NOT_PERMITTED => Err(InscribeError::PrivilegeRequired(
+            "DiskArbitration operation not permitted (kDAReturnNotPermitted)".to_string(),
+        )),
+        KDA_RETURN_NOT_PRIVILEGED => Err(InscribeError::PrivilegeRequired(
+            "DiskArbitration operation requires elevated privileges (kDAReturnNotPrivileged)"
+                .to_string(),
+        )),
+        other => Err(InscribeError::DeviceLockFailed {
+            path: path.display().to_string(),
+            reason: format!("DiskArbitration error 0x{other:08X}"),
+        }),
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub mod ffi {
+    use std::ffi::c_void;
+
+    pub type DASessionRef = *mut c_void;
+    pub type DADiskRef = *mut c_void;
+    pub type CFAllocatorRef = *const c_void;
+    pub type CFDictionaryRef = *const c_void;
+    pub type DADiskUnmountOptions = u32;
+    pub type DADiskClaimOptions = u32;
+    pub type DAReturn = i32;
+
+    #[link(name = "DiskArbitration", kind = "framework")]
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        pub fn DASessionCreate(allocator: CFAllocatorRef) -> DASessionRef;
+        pub fn DADiskCreateFromBSDName(
+            allocator: CFAllocatorRef,
+            session: DASessionRef,
+            name: *const std::ffi::c_char,
+        ) -> DADiskRef;
+        pub fn DADiskCopyDescription(disk: DADiskRef) -> CFDictionaryRef;
+        pub fn DADiskUnmount(
+            disk: DADiskRef,
+            options: DADiskUnmountOptions,
+            callback: *const c_void,
+            context: *mut c_void,
+        );
+        pub fn DADiskClaim(
+            disk: DADiskRef,
+            options: DADiskClaimOptions,
+            release_callback: *const c_void,
+            release_context: *mut c_void,
+            callback: *const c_void,
+            callback_context: *mut c_void,
+        );
+        pub fn CFRelease(cf: *const c_void);
+    }
+}
+
 /// Represents an exclusive claim over a macOS disk acquired via DiskArbitration.
 #[derive(Debug)]
 pub struct MacDiskClaim {
@@ -118,13 +196,81 @@ impl MacDiskClaim {
         drive: &DriveInfo,
         allow_external_usb_ssd: bool,
     ) -> Result<Self, InscribeError> {
-        // Enforce Drive Guard safety checks
+        Self::claim_and_unmount_with_attestation(drive, None, allow_external_usb_ssd)
+    }
+
+    /// Extends `claim_and_unmount` supporting live target attestation against TOCTOU races.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InscribeError::DriveGuardViolation` if the target is rejected or live attestation fails,
+    /// or `InscribeError::DeviceLockFailed` on failure.
+    pub fn claim_and_unmount_with_attestation(
+        drive: &DriveInfo,
+        live: Option<&DriveInfo>,
+        allow_external_usb_ssd: bool,
+    ) -> Result<Self, InscribeError> {
+        // Enforce Drive Guard safety checks on snapshot
         DriveGuard::validate_target_with_options(drive, allow_external_usb_ssd)?;
+
+        // Pre-operation live target attestation
+        if let Some(live_target) = live {
+            DriveGuard::attest_target(drive, live_target, allow_external_usb_ssd)?;
+        }
 
         let bsd = bsd_name(&drive.path);
         let raw_path = to_raw_character_device(&drive.path);
 
-        // On native macOS, this invokes DADiskCreateFromBSDName, DADiskUnmount, DADiskClaim
+        #[cfg(target_os = "macos")]
+        {
+            use std::ffi::CString;
+            use std::ptr;
+
+            let c_bsd = CString::new(bsd.clone()).map_err(|e| InscribeError::DeviceLockFailed {
+                path: drive.path.display().to_string(),
+                reason: format!("Invalid BSD disk name: {e}"),
+            })?;
+
+            unsafe {
+                let session = ffi::DASessionCreate(ptr::null());
+                if session.is_null() {
+                    return Err(InscribeError::DeviceLockFailed {
+                        path: drive.path.display().to_string(),
+                        reason: "Failed to create DASessionRef".to_string(),
+                    });
+                }
+
+                let disk = ffi::DADiskCreateFromBSDName(ptr::null(), session, c_bsd.as_ptr());
+                if disk.is_null() {
+                    ffi::CFRelease(session);
+                    return Err(InscribeError::DeviceNotFound(
+                        drive.path.display().to_string(),
+                    ));
+                }
+
+                // Force unmount whole media
+                ffi::DADiskUnmount(
+                    disk,
+                    DADISK_UNMOUNT_OPTION_WHOLE | DADISK_UNMOUNT_OPTION_FORCE,
+                    ptr::null(),
+                    ptr::null_mut(),
+                );
+
+                // Claim exclusively
+                ffi::DADiskClaim(
+                    disk,
+                    DADISK_CLAIM_OPTION_DEFAULT,
+                    ptr::null(),
+                    ptr::null_mut(),
+                    ptr::null(),
+                    ptr::null_mut(),
+                );
+
+                ffi::CFRelease(disk);
+                ffi::CFRelease(session);
+            }
+        }
+
         Ok(Self {
             bsd_name: bsd,
             raw_device_path: raw_path,
