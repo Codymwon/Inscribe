@@ -53,6 +53,52 @@ fn test_aligned_buffer_padding_to_sector_boundary() {
 }
 
 #[test]
+fn test_aligned_buffer_invalid_alignment_rejects_without_panic() {
+    // 1. with_capacity_and_alignment with zero alignment
+    let res_zero = AlignedBuffer::with_capacity_and_alignment(4096, 0);
+    assert!(res_zero.is_err(), "Zero alignment must return Err");
+
+    // 2. with_capacity_and_alignment with non-power-of-two alignment
+    let res_non_power = AlignedBuffer::with_capacity_and_alignment(4096, 3);
+    assert!(
+        res_non_power.is_err(),
+        "Non-power-of-two alignment must return Err"
+    );
+
+    let res_non_power_500 = AlignedBuffer::with_capacity_and_alignment(4096, 500);
+    assert!(
+        res_non_power_500.is_err(),
+        "Non-power-of-two alignment must return Err"
+    );
+
+    // 3. from_slice_padded with zero alignment
+    let res_slice_zero = AlignedBuffer::from_slice_padded(&[1, 2, 3], 0);
+    assert!(
+        res_slice_zero.is_err(),
+        "from_slice_padded with zero alignment must return Err"
+    );
+
+    // 4. from_slice_padded with non-power-of-two alignment
+    let res_slice_non_power = AlignedBuffer::from_slice_padded(&[1, 2, 3], 7);
+    assert!(
+        res_slice_non_power.is_err(),
+        "from_slice_padded with non-power-of-two alignment must return Err"
+    );
+
+    // 5. pad_to_alignment with zero and non-power-of-two alignment
+    let mut buf = AlignedBuffer::with_capacity(4096).expect("Allocation failed");
+    buf.set_len(100).expect("set_len failed");
+    assert!(
+        buf.pad_to_alignment(0).is_err(),
+        "pad_to_alignment with zero must return Err"
+    );
+    assert!(
+        buf.pad_to_alignment(15).is_err(),
+        "pad_to_alignment with non-power-of-two must return Err"
+    );
+}
+
+#[test]
 fn test_direct_writer_unaligned_payload_padding() {
     let temp_dir = std::env::temp_dir();
     let test_file_path = temp_dir.join(format!(

@@ -55,6 +55,12 @@ impl AlignedBuffer {
             ));
         }
 
+        if alignment == 0 || !alignment.is_power_of_two() {
+            return Err(InscribeError::Other(format!(
+                "Invalid alignment {alignment}: must be a non-zero power of two"
+            )));
+        }
+
         // Layout requires size to be rounded up to multiple of align
         let layout_size = if capacity % alignment == 0 {
             capacity
@@ -98,6 +104,12 @@ impl AlignedBuffer {
             return Err(InscribeError::Other(
                 "Cannot create AlignedBuffer from empty slice".to_string(),
             ));
+        }
+
+        if alignment == 0 || !alignment.is_power_of_two() {
+            return Err(InscribeError::Other(format!(
+                "Invalid alignment {alignment}: must be a non-zero power of two"
+            )));
         }
 
         let rem = data.len() % alignment;
@@ -172,6 +184,12 @@ impl AlignedBuffer {
 
     /// Pads the current logical length up to the nearest multiple of `alignment` with `0x00`.
     pub fn pad_to_alignment(&mut self, alignment: usize) -> Result<(), InscribeError> {
+        if alignment == 0 || !alignment.is_power_of_two() {
+            return Err(InscribeError::Other(format!(
+                "Invalid alignment {alignment}: must be a non-zero power of two"
+            )));
+        }
+
         let rem = self.len % alignment;
         if rem != 0 {
             let padded_len = self
