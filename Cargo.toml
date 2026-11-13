@@ -58,6 +58,9 @@ slint = { version = "1.18.1", default-features = false, features = [
 slint-build = "1.18.1"
 swash = "0.1.19"
 
+# Native File Dialog
+rfd = "0.17.2"
+
 # CLI helpers
 clap = { version = "4.5.31", features = ["derive"] }
 indicatif = "0.17.11"
