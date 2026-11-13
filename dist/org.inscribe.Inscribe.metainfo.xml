@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  AppStream Metadata for Inscribe
+  Official FreeDesktop Specification: https://freedesktop.org/software/appstream/docs/
+-->
+<component type="desktop-application">
+  <id>org.inscribe.Inscribe</id>
+  <metadata_license>MIT</metadata_license>
+  <project_license>MIT OR Apache-2.0</project_license>
+  <name>Inscribe</name>
+  <summary>High-Performance Native USB and Disk Image Flasher</summary>
+
+  <description>
+    <p>
+      Inscribe is a modern, lightweight, memory-efficient native image writer built in Rust with Slint.
+      Designed as a sub-10MB replacement for bloated Electron flashers, it streams compressed images
+      directly to block devices with zero disk buffering and bit-for-bit BLAKE3 verification.
+    </p>
+    <p>
+      Features:
+    </p>
+    <ul>
+      <li>Direct zero-disk-buffering decompression for ISO, IMG, XZ, GZ, ZST, BZ2, and ZIP archives.</li>
+      <li>Hardware line-speed 4MB direct I/O writes with sector-aligned buffers.</li>
+      <li>Two-pass BLAKE3 verification ensuring flawless writes to physical storage media.</li>
+      <li>Drive Guard safety engine preventing accidental overwrites of system partitions and internal drives.</li>
+    </ul>
+  </description>
+
+  <launchable type="desktop-id">inscribe.desktop</launchable>
+
+  <provides>
+    <binary>inscribe-gui</binary>
+  </provides>
+
+  <categories>
+    <category>Utility</category>
+    <category>System</category>
+    <category>Archiving</category>
+  </categories>
+
+  <developer id="org.inscribe">
+    <name>Inscribe Contributors</name>
+  </developer>
+
+  <url type="homepage">https://github.com/inscribe/inscribe</url>
+  <url type="bugtracker">https://github.com/inscribe/inscribe/issues</url>
+</component>

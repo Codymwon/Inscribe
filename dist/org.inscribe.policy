@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD polkit Policy Configuration 1.0//EN"
+"http://www.freedesktop.org/software/polkit/policyconfig-1.dtd">
+<!--
+  Polkit Policy Definition for Inscribe
+  Official FreeDesktop Specification: https://www.freedesktop.org/software/polkit/docs/latest/polkit.8.html
+-->
+<policyconfig>
+  <vendor>Inscribe Project</vendor>
+  <vendor_url>https://github.com/inscribe/inscribe</vendor_url>
+  <icon_name>inscribe</icon_name>
+
+  <action id="org.inscribe.pkexec.run">
+    <description>Run Inscribe with elevated privileges</description>
+    <message>Authentication is required to flash disk images to physical drives</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/bin/inscribe-gui</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+  </action>
+</policyconfig>

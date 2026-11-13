@@ -1,0 +1,45 @@
+# Flatpak Manifest for Inscribe
+# Official Flatpak Specification: https://docs.flatpak.org/en/latest/manifests.html
+app-id: org.inscribe.Inscribe
+runtime: org.freedesktop.Platform
+runtime-version: '24.08'
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: inscribe-gui
+
+finish-args:
+  # Display & Wayland/X11 Access
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --share=ipc
+  - --device=dri
+
+  # UDisks2 System D-Bus access for partition unmounting and raw block FD acquisition
+  # Source: https://docs.flatpak.org/en/latest/sandbox-permissions.html#d-bus-access
+  - --system-talk-name=org.freedesktop.UDisks2
+
+  # Direct block device access for physical drive writing
+  - --device=all
+
+  # File system read access for opening OS image files (.iso, .img, .xz, .zip, etc.)
+  - --filesystem=host:ro
+  - --filesystem=/media:ro
+  - --filesystem=/run/media:ro
+
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+  env:
+    CARGO_HOME: /run/build/inscribe/cargo
+
+modules:
+  - name: inscribe
+    buildsystem: simple
+    build-commands:
+      - cargo build --release -p inscribe-gui
+      - install -Dm755 target/release/inscribe-gui /app/bin/inscribe-gui
+      - install -Dm644 dist/inscribe.desktop /app/share/applications/org.inscribe.Inscribe.desktop
+      - install -Dm644 dist/org.inscribe.Inscribe.metainfo.xml /app/share/metainfo/org.inscribe.Inscribe.metainfo.xml
+    sources:
+      - type: dir
+        path: ../..

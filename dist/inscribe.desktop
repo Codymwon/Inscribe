@@ -1,0 +1,20 @@
+[Desktop Entry]
+# FreeDesktop Desktop Entry Specification
+# Source: https://specifications.freedesktop.org/desktop-entry-spec/latest/
+Version=1.5
+Type=Application
+Name=Inscribe
+GenericName=Disk Image Flasher
+Comment=Ultra-fast, zero-bloat disk flasher with BLAKE3 verification and Drive Guard protection
+Exec=inscribe-gui %U
+Icon=inscribe
+Terminal=false
+StartupNotify=true
+Categories=Utility;System;Archiving;
+Keywords=usb;flash;image;iso;raw;writer;burner;etcher;drive;
+MimeType=application/x-raw-disk-image;application/x-iso9660-image;application/x-compressed-tar;application/gzip;application/x-xz;application/zstd;application/x-bzip2;application/zip;
+Actions=NewWindow;
+
+[Desktop Action NewWindow]
+Name=Open New Window
+Exec=inscribe-gui

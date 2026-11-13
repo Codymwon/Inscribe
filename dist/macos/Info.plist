@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS Application Bundle Info.plist for Inscribe
+  Official Apple Documentation: https://developer.apple.com/documentation/bundleresources/information_property_list
+-->
+<plist version="1.0">
+<dict>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>Inscribe</string>
+    <key>CFBundleDisplayName</key>
+    <string>Inscribe</string>
+    <key>CFBundleIdentifier</key>
+    <string>org.inscribe.Inscribe</string>
+    <key>CFBundleVersion</key>
+    <string>0.1.0</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+    <key>CFBundleExecutable</key>
+    <string>inscribe-gui</string>
+    <key>CFBundleIconFile</key>
+    <string>inscribe</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>11.0</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSSupportsAutomaticGraphicsSwitching</key>
+    <true/>
+    <key>NSRequiresAquaSystemAppearance</key>
+    <false/>
+    <key>NSHumanReadableCopyright</key>
+    <string>Copyright © 2026 Inscribe Contributors. Licensed under MIT or Apache-2.0.</string>
+</dict>
+</plist>
