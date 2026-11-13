@@ -6,6 +6,9 @@ use inscribe_core::image::{ImageFormat, detect_format, inspect_image};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 /// Information regarding the currently selected disk image.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +44,7 @@ pub struct AppState {
     drives: Vec<DriveInfo>,
     allow_external_usb_ssd: bool,
     is_flashing: bool,
+    cancel_token: Option<Arc<AtomicBool>>,
 }
 
 impl Default for AppState {
@@ -59,6 +63,7 @@ impl AppState {
             drives: Vec::new(),
             allow_external_usb_ssd: false,
             is_flashing: false,
+            cancel_token: None,
         }
     }
 
@@ -95,6 +100,32 @@ impl AppState {
     /// Sets whether flashing is in progress.
     pub fn set_is_flashing(&mut self, flashing: bool) {
         self.is_flashing = flashing;
+        if !flashing {
+            self.cancel_token = None;
+        }
+    }
+
+    /// Cancellation token for active flash worker, if currently flashing.
+    #[must_use]
+    pub fn cancel_token(&self) -> Option<Arc<AtomicBool>> {
+        self.cancel_token.clone()
+    }
+
+    /// Sets the active cancellation token.
+    pub fn set_cancel_token(&mut self, token: Option<Arc<AtomicBool>>) {
+        self.cancel_token = token;
+    }
+
+    /// Triggers cancellation on the active flash worker.
+    ///
+    /// Returns `true` if a cancellation token was present and signaled.
+    pub fn cancel_active_flash(&self) -> bool {
+        if let Some(ref token) = self.cancel_token {
+            token.store(true, Ordering::SeqCst);
+            true
+        } else {
+            false
+        }
     }
 
     /// Toggles or sets the "Allow External USB SSD" safety preference.
@@ -219,6 +250,19 @@ impl AppState {
     }
 }
 
+/// Formats a duration into a human-readable string (e.g. `2m 15s` or `45s`).
+#[must_use]
+pub fn format_duration(duration: Duration) -> String {
+    let total_secs = duration.as_secs();
+    let mins = total_secs / 60;
+    let secs = total_secs % 60;
+    if mins > 0 {
+        format!("{mins}m {secs:02}s")
+    } else {
+        format!("{secs}s")
+    }
+}
+
 /// Formats a byte quantity into a human-readable decimal unit (e.g. `32.0 GB`).
 #[must_use]
 pub fn format_bytes(bytes: u64) -> String {
@@ -259,6 +303,29 @@ mod tests {
             is_system: system,
             mount_points: vec![],
         }
+    }
+
+    #[test]
+    fn test_format_duration() {
+        assert_eq!(format_duration(Duration::from_secs(45)), "45s");
+        assert_eq!(format_duration(Duration::from_secs(60)), "1m 00s");
+        assert_eq!(format_duration(Duration::from_secs(125)), "2m 05s");
+    }
+
+    #[test]
+    fn test_app_state_cancellation_token() {
+        let mut state = AppState::new();
+        assert!(!state.cancel_active_flash());
+
+        let token = Arc::new(AtomicBool::new(false));
+        state.set_cancel_token(Some(token.clone()));
+        assert!(!token.load(Ordering::SeqCst));
+
+        assert!(state.cancel_active_flash());
+        assert!(token.load(Ordering::SeqCst));
+
+        state.set_is_flashing(false);
+        assert!(state.cancel_token().is_none());
     }
 
     #[test]
