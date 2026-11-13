@@ -42,11 +42,10 @@ impl Drop for TestTempDir {
 }
 
 fn init_test_env() {
-    if std::env::var("WINIT_UNIX_BACKEND").is_err() {
-        // SAFETY: Headless test runner environment variable before event loop initialization
-        unsafe {
-            std::env::set_var("WINIT_UNIX_BACKEND", "x11");
-        }
+    // SAFETY: Preparing environment for test runner before Winit event loop initializes
+    unsafe {
+        std::env::remove_var("WAYLAND_DISPLAY");
+        std::env::set_var("WINIT_UNIX_BACKEND", "x11");
     }
 }
 
