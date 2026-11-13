@@ -5,8 +5,11 @@
 //! Drive Guard safety integration.
 
 slint::slint! {
-    export { AppWindow } from "../ui/appwindow.slint";
+    export { AppWindow, DriveItem } from "../ui/appwindow.slint";
 }
+
+pub mod bridge;
+pub mod state;
 
 /// Create a new instance of the Inscribe application window.
 pub fn create_app_window() -> Result<AppWindow, slint::PlatformError> {

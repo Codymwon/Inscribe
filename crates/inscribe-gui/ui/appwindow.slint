@@ -1,5 +1,17 @@
 import { Button, CheckBox, Switch, ProgressIndicator, ScrollView } from "std-widgets.slint";
 
+export struct DriveItem {
+    path: string,
+    name: string,
+    size-text: string,
+    is-system: bool,
+    is-flashable: bool,
+    is-external-usb-ssd: bool,
+    vendor: string,
+    model: string,
+    bus: string,
+}
+
 export component AppWindow inherits Window {
     title: "Inscribe - Fast, Safe Disk Imager";
     min-width: 820px;
@@ -21,6 +33,9 @@ export component AppWindow inherits Window {
     in-out property <string> drive-name: "";
     in-out property <string> drive-size-text: "";
     in-out property <int> drive-count: 0;
+    in-out property <[DriveItem]> drives: [];
+    in-out property <int> selected-drive-index: -1;
+    in-out property <bool> show-drive-modal: false;
 
     in-out property <bool> can-flash: false;
     in-out property <bool> is-flashing: false;
@@ -45,6 +60,8 @@ export component AppWindow inherits Window {
     // -------------------------------------------------------------------------
     callback select-image-clicked();
     callback select-drive-clicked();
+    callback drive-selected-by-index(int);
+    callback refresh-drives-clicked();
     callback flash-clicked();
     callback cancel-flash-clicked();
     callback toggle-usb-ssd-modal-clicked();
@@ -82,6 +99,9 @@ export component AppWindow inherits Window {
             activated => {
                 if root.show-usb-ssd-modal {
                     root.show-usb-ssd-modal = false;
+                }
+                if root.show-drive-modal {
+                    root.show-drive-modal = false;
                 }
             }
         }
@@ -599,6 +619,257 @@ export component AppWindow inherits Window {
                             accessible-label: "Save settings and close modal";
                             clicked => {
                                 root.show-usb-ssd-modal = false;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---------------------------------------------------------------------
+        // "Select Target Drive" Selection Modal
+        // ---------------------------------------------------------------------
+        if root.show-drive-modal: Rectangle {
+            width: 100%;
+            height: 100%;
+            background: #000000a6;
+
+            // Block clicks from leaking behind the dialog
+            TouchArea {
+                accessible-role: none;
+            }
+
+            Rectangle {
+                width: 620px;
+                border-radius: 10px;
+                background: #252528;
+                border-width: 1px;
+                border-color: #55555c;
+
+                VerticalLayout {
+                    padding: 24px;
+                    spacing: 16px;
+
+                    HorizontalLayout {
+                        alignment: space-between;
+
+                        Text {
+                            text: "🎯 Select Target Drive";
+                            font-size: 18px;
+                            font-weight: 700;
+                            color: #f3f3f3;
+                        }
+
+                        Button {
+                            text: "✕";
+                            accessible-role: button;
+                            accessible-label: "Close drive selection dialog";
+                            clicked => {
+                                root.show-drive-modal = false;
+                            }
+                        }
+                    }
+
+                    if root.drives.length == 0: VerticalLayout {
+                        alignment: center;
+                        padding-top: 30px;
+                        padding-bottom: 30px;
+                        spacing: 8px;
+
+                        Text {
+                            text: "⏳ Searching for removable drives...";
+                            font-size: 14px;
+                            color: #9e9e9e;
+                            horizontal-alignment: center;
+                        }
+                        Text {
+                            text: "Plug in a USB flash drive or SD card to begin.";
+                            font-size: 12px;
+                            color: #666666;
+                            horizontal-alignment: center;
+                        }
+                    }
+
+                    if root.drives.length > 0: ScrollView {
+                        height: 240px;
+
+                        VerticalLayout {
+                            spacing: 8px;
+
+                            for drive[idx] in root.drives: Rectangle {
+                                border-radius: 6px;
+                                background: drive.is-flashable ? (root.selected-drive-index == idx ? #0078d426 : #2d2d31) : #1e1e21;
+                                border-width: 1px;
+                                border-color: drive.is-flashable ? (root.selected-drive-index == idx ? #0078d4 : #3e3e42) : #2a2a2d;
+
+                                TouchArea {
+                                    enabled: drive.is-flashable;
+                                    accessible-role: button;
+                                    accessible-label: "Select " + drive.name;
+                                    clicked => {
+                                        root.drive-selected-by-index(idx);
+                                        root.show-drive-modal = false;
+                                    }
+                                }
+
+                                HorizontalLayout {
+                                    padding: 12px;
+                                    alignment: space-between;
+
+                                    VerticalLayout {
+                                        spacing: 4px;
+
+                                        HorizontalLayout {
+                                            spacing: 8px;
+
+                                            Text {
+                                                text: drive.name;
+                                                font-size: 13px;
+                                                font-weight: 600;
+                                                color: drive.is-flashable ? #ffffff : #777777;
+                                            }
+
+                                            Text {
+                                                text: "(" + drive.path + ")";
+                                                font-size: 11px;
+                                                color: #888888;
+                                                vertical-alignment: center;
+                                            }
+                                        }
+
+                                        HorizontalLayout {
+                                            spacing: 10px;
+
+                                            Text {
+                                                text: "Size: " + drive.size-text;
+                                                font-size: 11px;
+                                                color: drive.is-flashable ? #4cc2ff : #666666;
+                                            }
+
+                                            Text {
+                                                text: "•  Bus: " + drive.bus;
+                                                font-size: 11px;
+                                                color: #777777;
+                                            }
+                                        }
+                                    }
+
+                                    HorizontalLayout {
+                                        alignment: end;
+                                        spacing: 8px;
+
+                                        if drive.is-system: Rectangle {
+                                            border-radius: 4px;
+                                            background: #d83b0126;
+                                            border-width: 1px;
+                                            border-color: #d83b01;
+                                            height: 24px;
+
+                                            HorizontalLayout {
+                                                padding-left: 8px;
+                                                padding-right: 8px;
+
+                                                Text {
+                                                    text: "⛔ System Drive";
+                                                    font-size: 10px;
+                                                    font-weight: 600;
+                                                    color: #ff8c00;
+                                                    vertical-alignment: center;
+                                                }
+                                            }
+                                        }
+
+                                        if !drive.is-system && drive.is-external-usb-ssd && !drive.is-flashable: Rectangle {
+                                            border-radius: 4px;
+                                            background: #d83b011a;
+                                            border-width: 1px;
+                                            border-color: #d83b0180;
+                                            height: 24px;
+
+                                            HorizontalLayout {
+                                                padding-left: 8px;
+                                                padding-right: 8px;
+
+                                                Text {
+                                                    text: "⚠️ USB SSD (Blocked)";
+                                                    font-size: 10px;
+                                                    font-weight: 600;
+                                                    color: #ffaa44;
+                                                    vertical-alignment: center;
+                                                }
+                                            }
+                                        }
+
+                                        if !drive.is-system && drive.is-external-usb-ssd && drive.is-flashable: Rectangle {
+                                            border-radius: 4px;
+                                            background: #107c4126;
+                                            border-width: 1px;
+                                            border-color: #107c41;
+                                            height: 24px;
+
+                                            HorizontalLayout {
+                                                padding-left: 8px;
+                                                padding-right: 8px;
+
+                                                Text {
+                                                    text: "⚠️ USB SSD (Allowed)";
+                                                    font-size: 10px;
+                                                    font-weight: 600;
+                                                    color: #60cdff;
+                                                    vertical-alignment: center;
+                                                }
+                                            }
+                                        }
+
+                                        if drive.is-flashable && !drive.is-external-usb-ssd: Rectangle {
+                                            border-radius: 4px;
+                                            background: #107c4126;
+                                            border-width: 1px;
+                                            border-color: #107c41;
+                                            height: 24px;
+
+                                            HorizontalLayout {
+                                                padding-left: 8px;
+                                                padding-right: 8px;
+
+                                                Text {
+                                                    text: "✓ Removable";
+                                                    font-size: 10px;
+                                                    font-weight: 600;
+                                                    color: #4cc2ff;
+                                                    vertical-alignment: center;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        height: 1px;
+                        background: #3e3e42;
+                    }
+
+                    HorizontalLayout {
+                        alignment: space-between;
+
+                        Button {
+                            text: "🔄 Rescan Drives";
+                            accessible-role: button;
+                            accessible-label: "Rescan connected storage drives";
+                            clicked => {
+                                root.refresh-drives-clicked();
+                            }
+                        }
+
+                        Button {
+                            text: "Close";
+                            accessible-role: button;
+                            accessible-label: "Close target selection modal";
+                            clicked => {
+                                root.show-drive-modal = false;
                             }
                         }
                     }
