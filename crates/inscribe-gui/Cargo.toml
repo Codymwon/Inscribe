@@ -7,6 +7,10 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[lib]
+name = "inscribe_gui"
+path = "src/lib.rs"
+
 [[bin]]
 name = "inscribe-gui"
 path = "src/main.rs"

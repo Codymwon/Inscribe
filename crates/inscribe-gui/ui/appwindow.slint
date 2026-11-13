@@ -1,0 +1,609 @@
+import { Button, CheckBox, Switch, ProgressIndicator, ScrollView } from "std-widgets.slint";
+
+export component AppWindow inherits Window {
+    title: "Inscribe - Fast, Safe Disk Imager";
+    min-width: 820px;
+    min-height: 520px;
+    preferred-width: 860px;
+    preferred-height: 540px;
+    background: #1c1c1f;
+    default-font-family: "Segoe UI, -apple-system, BlinkMacSystemFont, Roboto, sans-serif";
+
+    // -------------------------------------------------------------------------
+    // Component Properties (3-Step State & Progress)
+    // -------------------------------------------------------------------------
+    in-out property <bool> image-selected: false;
+    in-out property <string> image-name: "";
+    in-out property <string> image-size-text: "";
+    in-out property <string> image-format-badge: "";
+
+    in-out property <bool> drive-selected: false;
+    in-out property <string> drive-name: "";
+    in-out property <string> drive-size-text: "";
+    in-out property <int> drive-count: 0;
+
+    in-out property <bool> can-flash: false;
+    in-out property <bool> is-flashing: false;
+    in-out property <float> flash-progress: 0.0;
+    in-out property <string> flash-speed-text: "";
+    in-out property <string> flash-phase-text: "";
+
+    in-out property <bool> drag-hover-active: false;
+
+    // -------------------------------------------------------------------------
+    // External USB SSD Modal & Safety Warning Properties
+    // -------------------------------------------------------------------------
+    in-out property <bool> show-usb-ssd-modal: false;
+    in-out property <bool> allow-external-usb-ssd: false;
+
+    in-out property <string> safety-warning-markdown: "**⚠️ Warning: Advanced Storage Mode**\n\nExternal USB SSDs may contain personal files or system backups. **Flashing will completely overwrite all data** on the selected drive.\n\nBy default, Inscribe blocks all non-removable media and internal buses (NVMe, SATA, SAS) to prevent catastrophic system data loss. Only enable this if you are certain your target is an external USB SSD enclosure.\n\nAll existing data, partitions, and files will be permanently destroyed.";
+
+    in-out property <styled-text> safety-warning-styled: @markdown("**⚠️ Warning: Advanced Storage Mode**\n\nExternal USB SSDs may contain personal files or system backups. **Flashing will completely overwrite all data** on the selected drive.\n\nBy default, Inscribe blocks all non-removable media and internal buses (NVMe, SATA, SAS) to prevent catastrophic system data loss. Only enable this if you are certain your target is an external USB SSD enclosure.\n\nAll existing data, partitions, and files will be permanently destroyed.");
+
+    // -------------------------------------------------------------------------
+    // Callbacks
+    // -------------------------------------------------------------------------
+    callback select-image-clicked();
+    callback select-drive-clicked();
+    callback flash-clicked();
+    callback cancel-flash-clicked();
+    callback toggle-usb-ssd-modal-clicked();
+    callback file-dropped(string);
+
+    forward-focus: main-scope;
+
+    main-scope := FocusScope {
+        // Keyboard Shortcuts
+        KeyBinding {
+            keys: @keys(Control + O);
+            activated => {
+                root.select-image-clicked();
+            }
+        }
+
+        KeyBinding {
+            keys: @keys(Control + D);
+            activated => {
+                root.select-drive-clicked();
+            }
+        }
+
+        KeyBinding {
+            keys: @keys(Control + Return);
+            activated => {
+                if root.can-flash && !root.is-flashing {
+                    root.flash-clicked();
+                }
+            }
+        }
+
+        KeyBinding {
+            keys: @keys(Escape);
+            activated => {
+                if root.show-usb-ssd-modal {
+                    root.show-usb-ssd-modal = false;
+                }
+            }
+        }
+
+        // ---------------------------------------------------------------------
+        // Main Application Layout
+        // ---------------------------------------------------------------------
+        VerticalLayout {
+            padding: 24px;
+            spacing: 20px;
+
+            // Top Header Bar
+            HorizontalLayout {
+                alignment: space-between;
+
+                VerticalLayout {
+                    spacing: 4px;
+
+                    HorizontalLayout {
+                        spacing: 10px;
+
+                        Text {
+                            text: "INSCRIBE";
+                            font-size: 22px;
+                            font-weight: 700;
+                            color: #f3f3f3;
+                            letter-spacing: 1.5px;
+                        }
+
+                        Rectangle {
+                            border-radius: 4px;
+                            background: #0078d42a;
+                            border-width: 1px;
+                            border-color: #0078d480;
+
+                            HorizontalLayout {
+                                padding-left: 8px;
+                                padding-right: 8px;
+
+                                Text {
+                                    text: "v0.1.0";
+                                    font-size: 11px;
+                                    font-weight: 600;
+                                    color: #60cdff;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+                    }
+
+                    Text {
+                        text: "Safe, streaming, zero-buffer direct block imager";
+                        font-size: 13px;
+                        color: #9e9e9e;
+                    }
+                }
+
+                // Settings & Safety Warning Toggle Pill
+                Rectangle {
+                    border-radius: 6px;
+                    background: root.allow-external-usb-ssd ? #d83b0126 : #2a2a2d;
+                    border-width: 1px;
+                    border-color: root.allow-external-usb-ssd ? #d83b01 : #3e3e42;
+                    height: 36px;
+
+                    TouchArea {
+                        accessible-role: button;
+                        accessible-label: "Toggle External USB SSD safety settings";
+                        clicked => {
+                            root.toggle-usb-ssd-modal-clicked();
+                            root.show-usb-ssd-modal = !root.show-usb-ssd-modal;
+                        }
+                    }
+
+                    HorizontalLayout {
+                        padding-left: 14px;
+                        padding-right: 14px;
+                        spacing: 8px;
+                        alignment: center;
+
+                        Text {
+                            text: root.allow-external-usb-ssd ? "⚠️ USB SSD: ALLOWED" : "🛡️ USB SSD: BLOCKED";
+                            font-size: 12px;
+                            font-weight: 600;
+                            color: root.allow-external-usb-ssd ? #ff8c00 : #cccccc;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+            }
+
+            // -----------------------------------------------------------------
+            // Iconic 3-Step Cards
+            // -----------------------------------------------------------------
+            HorizontalLayout {
+                spacing: 18px;
+
+                // Step 1: Select Image Card
+                step1-card := Rectangle {
+                    border-radius: 8px;
+                    background: (drop-zone.has-drag || root.drag-hover-active) ? #0078d41a : #242427;
+                    border-width: (drop-zone.has-drag || root.drag-hover-active) ? 2px : 1px;
+                    border-color: (drop-zone.has-drag || root.drag-hover-active) ? #0078d4 : (root.image-selected ? #107c41 : #3a3a3e);
+                    horizontal-stretch: 1;
+
+                    drop-zone := DropArea {
+                        width: 100%;
+                        height: 100%;
+
+                        can-drop(event) => {
+                            return DragAction.copy;
+                        }
+
+                        dropped(event) => {
+                            root.drag-hover-active = false;
+                            return event.proposed-action;
+                        }
+                    }
+
+                    VerticalLayout {
+                        padding: 20px;
+                        spacing: 14px;
+                        alignment: space-between;
+
+                        VerticalLayout {
+                            spacing: 10px;
+
+                            HorizontalLayout {
+                                alignment: space-between;
+
+                                Rectangle {
+                                    width: 28px;
+                                    height: 28px;
+                                    border-radius: 14px;
+                                    background: root.image-selected ? #107c41 : #333338;
+
+                                    Text {
+                                        text: root.image-selected ? "✓" : "1";
+                                        font-size: 14px;
+                                        font-weight: 700;
+                                        color: #ffffff;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
+
+                                Text {
+                                    text: "Ctrl+O";
+                                    font-size: 11px;
+                                    color: #777777;
+                                    vertical-alignment: center;
+                                }
+                            }
+
+                            Text {
+                                text: "1. Select Image";
+                                font-size: 16px;
+                                font-weight: 600;
+                                color: #f3f3f3;
+                            }
+
+                            if !root.image-selected: Text {
+                                text: (drop-zone.has-drag || root.drag-hover-active) ? "Drop disk image file here..." : "Drag & drop image here or click below to browse.";
+                                font-size: 12px;
+                                color: (drop-zone.has-drag || root.drag-hover-active) ? #60cdff : #9e9e9e;
+                                wrap: word-wrap;
+                            }
+
+                            if root.image-selected: VerticalLayout {
+                                spacing: 4px;
+
+                                Text {
+                                    text: root.image-name;
+                                    font-size: 13px;
+                                    font-weight: 600;
+                                    color: #ffffff;
+                                    wrap: word-wrap;
+                                }
+
+                                Text {
+                                    text: "Size: " + root.image-size-text;
+                                    font-size: 12px;
+                                    color: #4cc2ff;
+                                }
+                            }
+                        }
+
+                        VerticalLayout {
+                            spacing: 8px;
+
+                            Text {
+                                text: ".iso, .img, .xz, .gz, .zst, .bz2, .zip";
+                                font-size: 10px;
+                                color: #666666;
+                                horizontal-alignment: center;
+                            }
+
+                            Button {
+                                text: root.image-selected ? "Change Image" : "Select Image";
+                                accessible-role: button;
+                                accessible-label: root.image-selected ? "Change selected disk image" : "Select disk image from storage";
+                                clicked => {
+                                    root.select-image-clicked();
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Step 2: Select Target Drive Card
+                step2-card := Rectangle {
+                    border-radius: 8px;
+                    background: #242427;
+                    border-width: 1px;
+                    border-color: root.drive-selected ? #107c41 : #3a3a3e;
+                    horizontal-stretch: 1;
+
+                    VerticalLayout {
+                        padding: 20px;
+                        spacing: 14px;
+                        alignment: space-between;
+
+                        VerticalLayout {
+                            spacing: 10px;
+
+                            HorizontalLayout {
+                                alignment: space-between;
+
+                                Rectangle {
+                                    width: 28px;
+                                    height: 28px;
+                                    border-radius: 14px;
+                                    background: root.drive-selected ? #107c41 : #333338;
+
+                                    Text {
+                                        text: root.drive-selected ? "✓" : "2";
+                                        font-size: 14px;
+                                        font-weight: 700;
+                                        color: #ffffff;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
+
+                                Text {
+                                    text: "Ctrl+D";
+                                    font-size: 11px;
+                                    color: #777777;
+                                    vertical-alignment: center;
+                                }
+                            }
+
+                            Text {
+                                text: "2. Select Target";
+                                font-size: 16px;
+                                font-weight: 600;
+                                color: #f3f3f3;
+                            }
+
+                            if !root.drive-selected: Text {
+                                text: root.drive-count > 0 ? (root.drive-count + " removable drive(s) detected.") : "Waiting for removable USB drive...";
+                                font-size: 12px;
+                                color: #9e9e9e;
+                                wrap: word-wrap;
+                            }
+
+                            if root.drive-selected: VerticalLayout {
+                                spacing: 4px;
+
+                                Text {
+                                    text: root.drive-name;
+                                    font-size: 13px;
+                                    font-weight: 600;
+                                    color: #ffffff;
+                                    wrap: word-wrap;
+                                }
+
+                                Text {
+                                    text: "Target capacity: " + root.drive-size-text;
+                                    font-size: 12px;
+                                    color: #4cc2ff;
+                                }
+                            }
+                        }
+
+                        VerticalLayout {
+                            spacing: 8px;
+
+                            Text {
+                                text: "System & internal drives strictly protected";
+                                font-size: 10px;
+                                color: #666666;
+                                horizontal-alignment: center;
+                            }
+
+                            Button {
+                                text: root.drive-selected ? "Change Target" : "Select Drive";
+                                accessible-role: button;
+                                accessible-label: root.drive-selected ? "Change target drive" : "Select target drive";
+                                clicked => {
+                                    root.select-drive-clicked();
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Step 3: Flash! Action Card
+                step3-card := Rectangle {
+                    border-radius: 8px;
+                    background: #242427;
+                    border-width: 1px;
+                    border-color: (root.can-flash && !root.is-flashing) ? #0078d4 : #3a3a3e;
+                    horizontal-stretch: 1;
+
+                    VerticalLayout {
+                        padding: 20px;
+                        spacing: 14px;
+                        alignment: space-between;
+
+                        VerticalLayout {
+                            spacing: 10px;
+
+                            HorizontalLayout {
+                                alignment: space-between;
+
+                                Rectangle {
+                                    width: 28px;
+                                    height: 28px;
+                                    border-radius: 14px;
+                                    background: (root.can-flash && !root.is-flashing) ? #0078d4 : #333338;
+
+                                    Text {
+                                        text: "3";
+                                        font-size: 14px;
+                                        font-weight: 700;
+                                        color: #ffffff;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
+
+                                Text {
+                                    text: "Ctrl+Enter";
+                                    font-size: 11px;
+                                    color: #777777;
+                                    vertical-alignment: center;
+                                }
+                            }
+
+                            Text {
+                                text: "3. Flash!";
+                                font-size: 16px;
+                                font-weight: 600;
+                                color: #f3f3f3;
+                            }
+
+                            if !root.is-flashing: Text {
+                                text: root.can-flash ? "Ready to flash! Pass 1 writes directly, Pass 2 verifies BLAKE3 bitstream." : "Select an image and removable target drive to start flashing.";
+                                font-size: 12px;
+                                color: root.can-flash ? #60cdff : #9e9e9e;
+                                wrap: word-wrap;
+                            }
+
+                            if root.is-flashing: VerticalLayout {
+                                spacing: 6px;
+
+                                Text {
+                                    text: root.flash-phase-text;
+                                    font-size: 13px;
+                                    font-weight: 600;
+                                    color: #ffffff;
+                                }
+
+                                ProgressIndicator {
+                                    progress: root.flash-progress;
+                                }
+
+                                Text {
+                                    text: root.flash-speed-text;
+                                    font-size: 11px;
+                                    color: #9e9e9e;
+                                }
+                            }
+                        }
+
+                        VerticalLayout {
+                            spacing: 8px;
+
+                            if !root.is-flashing: Button {
+                                text: "⚡ Flash!";
+                                primary: true;
+                                enabled: root.can-flash;
+                                accessible-role: button;
+                                accessible-label: "Start flashing image to target drive";
+                                clicked => {
+                                    root.flash-clicked();
+                                }
+                            }
+
+                            if root.is-flashing: Button {
+                                text: "Cancel Flashing";
+                                accessible-role: button;
+                                accessible-label: "Abort current flash operation";
+                                clicked => {
+                                    root.cancel-flash-clicked();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Bottom Status / Security Notice Bar
+            Rectangle {
+                border-radius: 6px;
+                background: #1e1e21;
+                border-width: 1px;
+                border-color: #333338;
+                height: 32px;
+
+                HorizontalLayout {
+                    padding-left: 14px;
+                    padding-right: 14px;
+                    alignment: space-between;
+
+                    Text {
+                        text: "Drive Guard: System drives & internal buses protected";
+                        font-size: 11px;
+                        color: #107c41;
+                        font-weight: 600;
+                        vertical-alignment: center;
+                    }
+
+                    Text {
+                        text: "Direct I/O zero-copy • BLAKE3 verified";
+                        font-size: 11px;
+                        color: #777777;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+        }
+
+        // ---------------------------------------------------------------------
+        // "Show External USB SSDs" Safety Warning Modal
+        // ---------------------------------------------------------------------
+        if root.show-usb-ssd-modal: Rectangle {
+            width: 100%;
+            height: 100%;
+            background: #000000a6;
+
+            // Block clicks from leaking behind the dialog
+            TouchArea {
+                accessible-role: none;
+            }
+
+            Rectangle {
+                width: 580px;
+                border-radius: 10px;
+                background: #252528;
+                border-width: 1px;
+                border-color: #55555c;
+
+                VerticalLayout {
+                    padding: 24px;
+                    spacing: 16px;
+
+                    HorizontalLayout {
+                        alignment: space-between;
+
+                        Text {
+                            text: "⚠️ Advanced Storage Settings";
+                            font-size: 18px;
+                            font-weight: 700;
+                            color: #ffaa44;
+                        }
+
+                        Button {
+                            text: "✕";
+                            accessible-role: button;
+                            accessible-label: "Close modal dialog";
+                            clicked => {
+                                root.show-usb-ssd-modal = false;
+                            }
+                        }
+                    }
+
+                    // Rich StyledText using compile-time @markdown syntax
+                    ScrollView {
+                        height: 180px;
+
+                        StyledText {
+                            text: root.safety-warning-styled;
+                        }
+                    }
+
+                    Rectangle {
+                        height: 1px;
+                        background: #3e3e42;
+                    }
+
+                    HorizontalLayout {
+                        alignment: space-between;
+
+                        CheckBox {
+                            text: "Allow External USB SSD Enclosures";
+                            checked <=> root.allow-external-usb-ssd;
+                        }
+
+                        Button {
+                            text: "Done";
+                            primary: true;
+                            accessible-role: button;
+                            accessible-label: "Save settings and close modal";
+                            clicked => {
+                                root.show-usb-ssd-modal = false;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
