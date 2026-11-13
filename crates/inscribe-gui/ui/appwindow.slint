@@ -42,6 +42,20 @@ export component AppWindow inherits Window {
     in-out property <float> flash-progress: 0.0;
     in-out property <string> flash-speed-text: "";
     in-out property <string> flash-phase-text: "";
+    in-out property <string> flash-eta-text: "";
+
+    // -------------------------------------------------------------------------
+    // Cancellation, Celebration & Error Dialog Properties
+    // -------------------------------------------------------------------------
+    in-out property <bool> show-cancel-modal: false;
+
+    in-out property <bool> show-success-screen: false;
+    in-out property <string> success-summary-text: "";
+    in-out property <string> success-hash-text: "";
+
+    in-out property <bool> show-error-screen: false;
+    in-out property <string> error-title-text: "Flashing Failed";
+    in-out property <string> error-message-text: "";
 
     in-out property <bool> drag-hover-active: false;
 
@@ -64,6 +78,9 @@ export component AppWindow inherits Window {
     callback refresh-drives-clicked();
     callback flash-clicked();
     callback cancel-flash-clicked();
+    callback confirm-cancel-clicked();
+    callback dismiss-cancel-modal-clicked();
+    callback dismiss-result-clicked();
     callback toggle-usb-ssd-modal-clicked();
     callback file-dropped(string);
 
@@ -97,11 +114,20 @@ export component AppWindow inherits Window {
         KeyBinding {
             keys: @keys(Escape);
             activated => {
+                if root.show-cancel-modal {
+                    root.show-cancel-modal = false;
+                    root.dismiss-cancel-modal-clicked();
+                }
                 if root.show-usb-ssd-modal {
                     root.show-usb-ssd-modal = false;
                 }
                 if root.show-drive-modal {
                     root.show-drive-modal = false;
+                }
+                if root.show-success-screen || root.show-error-screen {
+                    root.show-success-screen = false;
+                    root.show-error-screen = false;
+                    root.dismiss-result-clicked();
                 }
             }
         }
@@ -870,6 +896,297 @@ export component AppWindow inherits Window {
                             accessible-label: "Close target selection modal";
                             clicked => {
                                 root.show-drive-modal = false;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---------------------------------------------------------------------
+        // Cancellation Confirmation Modal
+        // ---------------------------------------------------------------------
+        if root.show-cancel-modal: Rectangle {
+            width: 100%;
+            height: 100%;
+            background: #000000a6;
+
+            TouchArea {
+                accessible-role: none;
+            }
+
+            Rectangle {
+                width: 500px;
+                border-radius: 10px;
+                background: #252528;
+                border-width: 1px;
+                border-color: #d83b01;
+
+                VerticalLayout {
+                    padding: 24px;
+                    spacing: 16px;
+
+                    HorizontalLayout {
+                        alignment: space-between;
+
+                        Text {
+                            text: "⚠️ Cancel Flashing?";
+                            font-size: 18px;
+                            font-weight: 700;
+                            color: #ffaa44;
+                        }
+
+                        Button {
+                            text: "✕";
+                            accessible-role: button;
+                            accessible-label: "Close cancellation dialog";
+                            clicked => {
+                                root.show-cancel-modal = false;
+                                root.dismiss-cancel-modal-clicked();
+                            }
+                        }
+                    }
+
+                    Text {
+                        text: "Are you sure you want to abort the flash operation in progress?\n\nHalting now will leave the target drive in an incomplete or corrupted state. You will need to re-flash the entire image before the drive can be booted or used.";
+                        font-size: 13px;
+                        color: #cccccc;
+                        wrap: word-wrap;
+                    }
+
+                    Rectangle {
+                        height: 1px;
+                        background: #3e3e42;
+                    }
+
+                    HorizontalLayout {
+                        alignment: space-between;
+
+                        Button {
+                            text: "Continue Flashing";
+                            primary: false;
+                            accessible-role: button;
+                            accessible-label: "Dismiss confirmation and continue flashing";
+                            clicked => {
+                                root.show-cancel-modal = false;
+                                root.dismiss-cancel-modal-clicked();
+                            }
+                        }
+
+                        Button {
+                            text: "Yes, Abort Flashing";
+                            primary: true;
+                            accessible-role: button;
+                            accessible-label: "Confirm cancellation and halt flash worker";
+                            clicked => {
+                                root.show-cancel-modal = false;
+                                root.confirm-cancel-clicked();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---------------------------------------------------------------------
+        // Celebration / Success Screen
+        // ---------------------------------------------------------------------
+        if root.show-success-screen: Rectangle {
+            width: 100%;
+            height: 100%;
+            background: #000000a6;
+
+            TouchArea {
+                accessible-role: none;
+            }
+
+            Rectangle {
+                width: 560px;
+                border-radius: 10px;
+                background: #252528;
+                border-width: 1px;
+                border-color: #107c41;
+
+                VerticalLayout {
+                    padding: 24px;
+                    spacing: 16px;
+
+                    HorizontalLayout {
+                        spacing: 10px;
+
+                        Rectangle {
+                            width: 32px;
+                            height: 32px;
+                            border-radius: 16px;
+                            background: #107c41;
+
+                            Text {
+                                text: "✓";
+                                font-size: 18px;
+                                font-weight: 700;
+                                color: #ffffff;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                        }
+
+                        Text {
+                            text: "🎉 Flashing & Verification Complete!";
+                            font-size: 18px;
+                            font-weight: 700;
+                            color: #107c41;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    Text {
+                        text: "The disk image has been written directly to physical storage and successfully verified bit-for-bit with cryptographic BLAKE3 checksums. The drive is now safe to unplug.";
+                        font-size: 13px;
+                        color: #cccccc;
+                        wrap: word-wrap;
+                    }
+
+                    Rectangle {
+                        border-radius: 6px;
+                        background: #1e1e21;
+                        border-width: 1px;
+                        border-color: #333338;
+
+                        VerticalLayout {
+                            padding: 14px;
+                            spacing: 8px;
+
+                            Text {
+                                text: root.success-summary-text;
+                                font-size: 13px;
+                                font-weight: 600;
+                                color: #60cdff;
+                            }
+
+                            Text {
+                                text: root.success-hash-text;
+                                font-size: 11px;
+                                color: #9e9e9e;
+                                wrap: word-wrap;
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        height: 1px;
+                        background: #3e3e42;
+                    }
+
+                    HorizontalLayout {
+                        alignment: end;
+
+                        Button {
+                            text: "Done / Flash Another";
+                            primary: true;
+                            accessible-role: button;
+                            accessible-label: "Close celebration screen and return to main window";
+                            clicked => {
+                                root.show-success-screen = false;
+                                root.dismiss-result-clicked();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---------------------------------------------------------------------
+        // Error Summary Screen
+        // ---------------------------------------------------------------------
+        if root.show-error-screen: Rectangle {
+            width: 100%;
+            height: 100%;
+            background: #000000a6;
+
+            TouchArea {
+                accessible-role: none;
+            }
+
+            Rectangle {
+                width: 560px;
+                border-radius: 10px;
+                background: #252528;
+                border-width: 1px;
+                border-color: #d83b01;
+
+                VerticalLayout {
+                    padding: 24px;
+                    spacing: 16px;
+
+                    HorizontalLayout {
+                        spacing: 10px;
+
+                        Rectangle {
+                            width: 32px;
+                            height: 32px;
+                            border-radius: 16px;
+                            background: #d83b01;
+
+                            Text {
+                                text: "!";
+                                font-size: 18px;
+                                font-weight: 700;
+                                color: #ffffff;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                        }
+
+                        Text {
+                            text: root.error-title-text;
+                            font-size: 18px;
+                            font-weight: 700;
+                            color: #ff8c00;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    Text {
+                        text: "An error occurred during flashing or verification:";
+                        font-size: 13px;
+                        color: #cccccc;
+                    }
+
+                    Rectangle {
+                        border-radius: 6px;
+                        background: #1e1e21;
+                        border-width: 1px;
+                        border-color: #d83b0140;
+
+                        VerticalLayout {
+                            padding: 14px;
+                            spacing: 8px;
+
+                            Text {
+                                text: root.error-message-text;
+                                font-size: 12px;
+                                color: #ffaa44;
+                                wrap: word-wrap;
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        height: 1px;
+                        background: #3e3e42;
+                    }
+
+                    HorizontalLayout {
+                        alignment: end;
+
+                        Button {
+                            text: "Dismiss";
+                            primary: true;
+                            accessible-role: button;
+                            accessible-label: "Dismiss error dialog";
+                            clicked => {
+                                root.show-error-screen = false;
+                                root.dismiss-result-clicked();
                             }
                         }
                     }
