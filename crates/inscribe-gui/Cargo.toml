@@ -15,6 +15,11 @@ path = "src/lib.rs"
 name = "inscribe-gui"
 path = "src/main.rs"
 
+[features]
+default = []
+renderer-femtovg = ["slint/renderer-femtovg"]
+renderer-software = ["slint/renderer-software"]
+
 [dependencies]
 inscribe-core.workspace = true
 slint.workspace = true

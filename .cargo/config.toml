@@ -1,0 +1,9 @@
+[target.'cfg(all())']
+linker = ".cargo/ld-wrapper.sh"
+rustflags = [
+    "-C", "force-unwind-tables=no",
+    "-C", "link-arg=-fuse-ld=lld",
+    "-C", "link-arg=-Wl,--gc-sections",
+    "-C", "link-arg=-Wl,--icf=all",
+    "-C", "link-arg=-Wl,--strip-all",
+]

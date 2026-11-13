@@ -50,16 +50,14 @@ zbus = { version = "5.5.0", default-features = false, features = ["tokio"] }
 slint = { version = "1.18.1", default-features = false, features = [
     "std",
     "compat-1-18",
-    "backend-winit",
-    "renderer-femtovg",
+    "backend-winit-x11",
     "renderer-software",
-    "accessibility",
 ] }
 slint-build = "1.18.1"
 swash = "0.1.19"
 
 # Native File Dialog
-rfd = "0.17.2"
+rfd = { version = "0.17.2", default-features = false, features = ["xdg-portal"] }
 
 # CLI helpers
 clap = { version = "4.5.31", features = ["derive"] }
@@ -67,7 +65,7 @@ indicatif = "0.17.11"
 
 # Logging / Diagnostics
 tracing = "0.1.41"
-tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3.19", default-features = false, features = ["fmt", "ansi"] }
 
 [profile.release]
 opt-level = "z"
