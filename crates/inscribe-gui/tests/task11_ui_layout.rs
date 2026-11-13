@@ -5,6 +5,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 #[test]
 fn test_appwindow_full_ui_acceptance_criteria() {
+    if std::env::var("WINIT_UNIX_BACKEND").is_err() {
+        // SAFETY: Only setting WINIT_UNIX_BACKEND for headless test runner before event loop initializes
+        unsafe {
+            std::env::set_var("WINIT_UNIX_BACKEND", "x11");
+        }
+    }
     let window = AppWindow::new().expect("AppWindow should compile and initialize");
 
     // =========================================================================
