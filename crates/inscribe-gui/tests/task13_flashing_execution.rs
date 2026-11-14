@@ -604,3 +604,68 @@ fn test_active_flash_cancellation_on_bridge_drop() {
         "Worker thread must receive cancellation when ActiveFlash is dropped"
     );
 }
+
+#[test]
+fn test_drag_and_drop_rejects_directories_fifos_and_unsupported_extensions() {
+    let _lock = UI_TEST_LOCK.lock().unwrap();
+    init_test_env();
+    let window = match AppWindow::new() {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("Skipping test: display server unavailable: {e}");
+            return;
+        }
+    };
+    let mock_scanner = Arc::new(MockDriveScanner::empty());
+    let mock_picker = Arc::new(MockFilePicker::new());
+    let mock_executor = Arc::new(MockFlashExecutor::new());
+
+    let bridge =
+        GuiBridge::with_executor(window.as_weak(), mock_scanner, mock_picker, mock_executor);
+    bridge.wire_callbacks(&window);
+
+    // 1. Drop a directory
+    let temp_dir = TestTempDir::new("inscribe_dropped_dir");
+    bridge.handle_file_dropped(temp_dir.path().to_str().unwrap());
+    assert!(!window.get_image_selected());
+    assert!(window.get_show_error_screen());
+    assert!(
+        window.get_error_title_text().contains("Invalid Image")
+            || window.get_error_message_text().contains("regular file")
+    );
+
+    window.invoke_dismiss_result_clicked();
+    assert!(!window.get_show_error_screen());
+
+    // 2. Drop an unsupported extension (e.g. .txt)
+    let txt_path = temp_dir.path().join("notes.txt");
+    std::fs::write(&txt_path, b"hello world").unwrap();
+    bridge.handle_file_dropped(txt_path.to_str().unwrap());
+    assert!(!window.get_image_selected());
+    assert!(window.get_show_error_screen());
+    assert!(
+        window.get_error_title_text().contains("Unsupported")
+            || window.get_error_message_text().contains("supported")
+    );
+
+    window.invoke_dismiss_result_clicked();
+    assert!(!window.get_show_error_screen());
+
+    // 3. Drop a FIFO / named pipe on Linux/Unix (must not hang on open/read)
+    #[cfg(unix)]
+    {
+        use std::ffi::CString;
+        let fifo_path = temp_dir.path().join("test_fifo.iso");
+        let c_path = CString::new(fifo_path.to_str().unwrap()).unwrap();
+        unsafe {
+            libc::mkfifo(c_path.as_ptr(), 0o644);
+        }
+        bridge.handle_file_dropped(fifo_path.to_str().unwrap());
+        assert!(!window.get_image_selected());
+        assert!(window.get_show_error_screen());
+        assert!(
+            window.get_error_title_text().contains("Invalid Image")
+                || window.get_error_message_text().contains("regular file")
+        );
+    }
+}

@@ -21,6 +21,44 @@ use tracing::{debug, error, info, warn};
 /// Whitelist of supported disk image and archive formats for file selection.
 pub const SUPPORTED_IMAGE_EXTENSIONS: &[&str] = &["iso", "img", "xz", "gz", "zst", "bz2", "zip"];
 
+/// Validates that a dropped path is an accessible regular file with a supported image extension.
+///
+/// Rejects directories, symlink loops, named pipes (FIFOs), sockets, and device files.
+///
+/// # Errors
+/// Returns `InscribeError` if path cannot be accessed, is not a regular file, or has an unsupported extension.
+pub fn validate_dropped_file(path: &Path) -> Result<(), InscribeError> {
+    let metadata = std::fs::metadata(path)
+        .map_err(|e| InscribeError::Other(format!("Cannot access '{}': {e}", path.display())))?;
+
+    if !metadata.is_file() {
+        return Err(InscribeError::Other(format!(
+            "Target '{}' is not a regular file (directories, pipes, and special devices are not supported).",
+            path.display()
+        )));
+    }
+
+    let has_supported_ext = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| {
+            SUPPORTED_IMAGE_EXTENSIONS
+                .iter()
+                .any(|&supported| supported.eq_ignore_ascii_case(ext))
+        })
+        .unwrap_or(false);
+
+    if !has_supported_ext {
+        return Err(InscribeError::Other(format!(
+            "File '{}' does not have a supported disk image extension ({})",
+            path.display(),
+            SUPPORTED_IMAGE_EXTENSIONS.join(", ")
+        )));
+    }
+
+    Ok(())
+}
+
 /// Trait abstracting native or simulated file picker dialogs.
 pub trait FilePicker: Send + Sync {
     /// Opens the file picker dialog and returns the selected filesystem path.
@@ -112,6 +150,9 @@ impl FlashExecutor for RealFlashExecutor {
         drive: &DriveInfo,
         allow_external_usb_ssd: bool,
     ) -> Result<FlashHandle, InscribeError> {
+        // Platform volume unmounting and exclusive lock acquisition prior to opening raw block writers
+        inscribe_core::drive::prepare_drive_for_writing(drive, allow_external_usb_ssd)?;
+
         let mut file = File::open(image_path).map_err(InscribeError::Io)?;
         let mut header = [0u8; 4096];
         let bytes_read = file.read(&mut header).unwrap_or(0);
@@ -145,10 +186,27 @@ impl FlashExecutor for RealFlashExecutor {
 /// Dedicated background worker thread polling storage drives for USB hotplug events.
 pub struct DrivePoller {
     running: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
     thread_handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl DrivePoller {
+    /// Pauses background drive polling notifications.
+    pub fn pause(&self) {
+        self.paused.store(true, Ordering::SeqCst);
+    }
+
+    /// Resumes background drive polling notifications.
+    pub fn resume(&self) {
+        self.paused.store(false, Ordering::SeqCst);
+    }
+
+    /// Whether polling notifications are currently paused.
+    #[must_use]
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::SeqCst)
+    }
+
     /// Spawns a background drive polling thread.
     ///
     /// Every `interval`, the scanner is queried. If the detected drive list changes,
@@ -158,7 +216,9 @@ impl DrivePoller {
         F: FnMut(Vec<DriveInfo>) + Send + 'static,
     {
         let running = Arc::new(AtomicBool::new(true));
+        let paused = Arc::new(AtomicBool::new(false));
         let thread_running = running.clone();
+        let thread_paused = paused.clone();
 
         let thread_handle = std::thread::Builder::new()
             .name("inscribe-drive-poller".to_string())
@@ -166,24 +226,26 @@ impl DrivePoller {
                 let mut last_drives: Option<Vec<DriveInfo>> = None;
 
                 while thread_running.load(Ordering::Relaxed) {
-                    match scanner.scan_drives() {
-                        Ok(current_drives) => {
-                            let has_changed = match last_drives.as_ref() {
-                                Some(prev) => prev != &current_drives,
-                                None => true,
-                            };
+                    if !thread_paused.load(Ordering::Relaxed) {
+                        match scanner.scan_drives() {
+                            Ok(current_drives) => {
+                                let has_changed = match last_drives.as_ref() {
+                                    Some(prev) => prev != &current_drives,
+                                    None => true,
+                                };
 
-                            if has_changed {
-                                debug!(
-                                    drive_count = current_drives.len(),
-                                    "Drive hotplug state change detected"
-                                );
-                                on_update(current_drives.clone());
-                                last_drives = Some(current_drives);
+                                if has_changed && !thread_paused.load(Ordering::Relaxed) {
+                                    debug!(
+                                        drive_count = current_drives.len(),
+                                        "Drive hotplug state change detected"
+                                    );
+                                    on_update(current_drives.clone());
+                                    last_drives = Some(current_drives);
+                                }
                             }
-                        }
-                        Err(e) => {
-                            error!(error = %e, "Background drive poller scan failure");
+                            Err(e) => {
+                                error!(error = %e, "Background drive poller scan failure");
+                            }
                         }
                     }
 
@@ -204,6 +266,7 @@ impl DrivePoller {
 
         Self {
             running,
+            paused,
             thread_handle,
         }
     }
@@ -383,10 +446,17 @@ impl GuiBridge {
 
         let poller = DrivePoller::start(scanner, interval, move |drives| {
             if let Some(bridge) = bridge_weak.upgrade() {
-                let bridge_inner = bridge.clone();
-                let _ = bridge.window.upgrade_in_event_loop(move |_| {
-                    bridge_inner.apply_drive_update(drives);
-                });
+                let is_flashing = bridge
+                    .state
+                    .lock()
+                    .map(|s| s.is_flashing())
+                    .unwrap_or(false);
+                if !is_flashing {
+                    let bridge_inner = bridge.clone();
+                    let _ = bridge.window.upgrade_in_event_loop(move |_| {
+                        bridge_inner.apply_drive_update(drives);
+                    });
+                }
             }
         });
 
@@ -412,6 +482,10 @@ impl GuiBridge {
                     return;
                 }
             };
+            if state.is_flashing() {
+                debug!("DrivePoller: Pausing drive list mutations while flashing is active");
+                return;
+            }
             let change = state.set_drives(drives.clone());
             (
                 change,
@@ -486,7 +560,20 @@ impl GuiBridge {
     /// Handles a drag-and-dropped file URI or path.
     pub fn handle_file_dropped(&self, path_str: &str) {
         let path = parse_file_drop_uri(path_str);
-        self.apply_image_path(path);
+        match validate_dropped_file(&path) {
+            Ok(()) => {
+                self.apply_image_path(path);
+            }
+            Err(e) => {
+                error!(path = %path.display(), error = %e, "Invalid file dropped");
+                let title = if e.to_string().contains("supported disk image extension") {
+                    "Unsupported File Format"
+                } else {
+                    "Invalid Image File"
+                };
+                self.apply_ui_error(title, e.to_string());
+            }
+        }
     }
 
     /// Inspects and applies an image path, updating internal state and Slint properties.
@@ -592,7 +679,7 @@ impl GuiBridge {
     /// Launches the background flash worker thread and begins listening to telemetry.
     pub fn handle_flash(self: &Arc<Self>) {
         let (image_path, drive, allow_ssd) = {
-            let state = match self.state.lock() {
+            let mut state = match self.state.lock() {
                 Ok(s) => s,
                 Err(e) => {
                     error!(error = %e, "Failed to lock state for flashing");
@@ -615,14 +702,34 @@ impl GuiBridge {
                 None => return,
             };
 
-            (image_path, drive, state.allow_external_usb_ssd())
+            let allow_ssd = state.allow_external_usb_ssd();
+
+            // Atomically flag is_flashing under initial lock to drop concurrent invocations
+            state.set_is_flashing(true);
+
+            (image_path, drive, allow_ssd)
         };
+
+        // Pause drive hotplug poller during flashing
+        if let Ok(lock) = self.poller.lock() {
+            if let Some(ref p) = *lock {
+                p.pause();
+            }
+        }
 
         // Live target attestation (prevent TOCTOU device swap races)
         let live_drives = match self.scanner.scan_drives() {
             Ok(d) => d,
             Err(e) => {
                 error!(error = %e, "Failed to scan drives for pre-flash attestation");
+                if let Ok(mut state) = self.state.lock() {
+                    state.set_is_flashing(false);
+                }
+                if let Ok(lock) = self.poller.lock() {
+                    if let Some(ref p) = *lock {
+                        p.resume();
+                    }
+                }
                 self.apply_flash_error(&e);
                 return;
             }
@@ -639,6 +746,14 @@ impl GuiBridge {
                     ),
                 );
                 error!(error = %err, "Target device missing during pre-flash attestation");
+                if let Ok(mut state) = self.state.lock() {
+                    state.set_is_flashing(false);
+                }
+                if let Ok(lock) = self.poller.lock() {
+                    if let Some(ref p) = *lock {
+                        p.resume();
+                    }
+                }
                 self.apply_flash_error(&err);
                 return;
             }
@@ -648,12 +763,16 @@ impl GuiBridge {
             inscribe_core::drive::guard::DriveGuard::attest_target(&drive, live_drive, allow_ssd)
         {
             error!(error = %err, "Pre-flash Drive Guard attestation failed");
+            if let Ok(mut state) = self.state.lock() {
+                state.set_is_flashing(false);
+            }
+            if let Ok(lock) = self.poller.lock() {
+                if let Some(ref p) = *lock {
+                    p.resume();
+                }
+            }
             self.apply_flash_error(&err);
             return;
-        }
-
-        if let Ok(mut state) = self.state.lock() {
-            state.set_is_flashing(true);
         }
 
         let apply_to_win = |win: AppWindow| {
@@ -680,6 +799,14 @@ impl GuiBridge {
             Ok(h) => h,
             Err(e) => {
                 error!(error = %e, "Failed to launch flash worker");
+                if let Ok(mut state) = self.state.lock() {
+                    state.set_is_flashing(false);
+                }
+                if let Ok(lock) = self.poller.lock() {
+                    if let Some(ref p) = *lock {
+                        p.resume();
+                    }
+                }
                 self.apply_flash_error(&e);
                 return;
             }
@@ -870,6 +997,11 @@ impl GuiBridge {
         if let Ok(mut state) = self.state.lock() {
             state.set_is_flashing(false);
         }
+        if let Ok(lock) = self.poller.lock() {
+            if let Some(ref p) = *lock {
+                p.resume();
+            }
+        }
 
         let summary_text = format!(
             "{} written at {:.1} MB/s ({})",
@@ -896,10 +1028,35 @@ impl GuiBridge {
         }
     }
 
+    /// Transitions the UI to display an error screen with specified title and message.
+    pub fn apply_ui_error(&self, title: impl Into<String>, message: impl Into<String>) {
+        let title = title.into();
+        let message = message.into();
+        let apply_to_win = move |win: AppWindow| {
+            win.set_is_flashing(false);
+            win.set_show_cancel_modal(false);
+            win.set_show_success_screen(false);
+            win.set_show_error_screen(true);
+            win.set_error_title_text(SharedString::from(title));
+            win.set_error_message_text(SharedString::from(message));
+        };
+
+        if let Some(win) = self.window.upgrade() {
+            apply_to_win(win);
+        } else {
+            let _ = self.window.upgrade_in_event_loop(apply_to_win);
+        }
+    }
+
     /// Transitions the UI to the error summary screen with actionable failure details.
     pub fn apply_flash_error(&self, err: &InscribeError) {
         if let Ok(mut state) = self.state.lock() {
             state.set_is_flashing(false);
+        }
+        if let Ok(lock) = self.poller.lock() {
+            if let Some(ref p) = *lock {
+                p.resume();
+            }
         }
 
         let (title, message) = match err {
@@ -938,20 +1095,7 @@ impl GuiBridge {
             ),
         };
 
-        let apply_to_win = move |win: AppWindow| {
-            win.set_is_flashing(false);
-            win.set_show_cancel_modal(false);
-            win.set_show_success_screen(false);
-            win.set_show_error_screen(true);
-            win.set_error_title_text(SharedString::from(title));
-            win.set_error_message_text(SharedString::from(message));
-        };
-
-        if let Some(win) = self.window.upgrade() {
-            apply_to_win(win);
-        } else {
-            let _ = self.window.upgrade_in_event_loop(apply_to_win);
-        }
+        self.apply_ui_error(title, message);
     }
 
     /// Shows the cancellation confirmation modal dialog.
@@ -1212,5 +1356,196 @@ mod tests {
             cancel_token.load(Ordering::SeqCst),
             "ActiveFlash drop must set cancel_token to true"
         );
+    }
+
+    #[test]
+    fn test_validate_dropped_file_rejects_directories_fifos_and_unsupported_extensions() {
+        let temp_dir = std::env::temp_dir().join(format!("test_drop_{}", std::process::id()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        // 1. Directory must be rejected
+        let res = validate_dropped_file(&temp_dir);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().to_string().contains("not a regular file"));
+
+        // 2. Unsupported extension must be rejected
+        let txt_file = temp_dir.join("test.txt");
+        std::fs::write(&txt_file, b"not an image").unwrap();
+        let res = validate_dropped_file(&txt_file);
+        assert!(res.is_err());
+        assert!(
+            res.unwrap_err()
+                .to_string()
+                .contains("supported disk image extension")
+        );
+
+        // 3. FIFO / named pipe on unix must be rejected
+        #[cfg(unix)]
+        {
+            use std::ffi::CString;
+            let fifo_file = temp_dir.join("test.iso");
+            let c_path = CString::new(fifo_file.to_str().unwrap()).unwrap();
+            unsafe {
+                libc::mkfifo(c_path.as_ptr(), 0o644);
+            }
+            let res = validate_dropped_file(&fifo_file);
+            assert!(res.is_err());
+            assert!(res.unwrap_err().to_string().contains("not a regular file"));
+            let _ = std::fs::remove_file(&fifo_file);
+        }
+
+        // 4. Valid regular file with supported extension must succeed
+        let iso_file = temp_dir.join("debian.iso");
+        std::fs::write(&iso_file, b"fake iso data").unwrap();
+        assert!(validate_dropped_file(&iso_file).is_ok());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[derive(Default)]
+    struct CountingExecutor {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FlashExecutor for CountingExecutor {
+        fn start_flash(
+            &self,
+            _image_path: &Path,
+            _drive: &DriveInfo,
+            _allow_external_usb_ssd: bool,
+        ) -> Result<FlashHandle, InscribeError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let (_tx, progress_rx) = crossbeam_channel::unbounded();
+            let cancel_token = Arc::new(AtomicBool::new(false));
+            let thread_handle = std::thread::spawn(|| {
+                std::thread::sleep(Duration::from_millis(100));
+                Err(InscribeError::Cancelled)
+            });
+            Ok(FlashHandle {
+                cancel_token,
+                progress_rx,
+                thread_handle,
+            })
+        }
+    }
+
+    #[test]
+    fn test_handle_flash_double_invocation_drops_second_call() {
+        let scanner = Arc::new(inscribe_core::drive::MockDriveScanner::empty());
+        let drive = DriveInfo {
+            path: PathBuf::from("/dev/sdb"),
+            model: "USB Drive".to_string(),
+            vendor: "Vendor".to_string(),
+            size: 8_000_000_000,
+            sector_size: 512,
+            bus_type: inscribe_core::drive::BusType::Usb,
+            is_removable: true,
+            is_read_only: false,
+            is_system: false,
+            mount_points: vec![],
+        };
+        scanner.add_drive(drive);
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("test_flash_double_{}", std::process::id()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let img_path = temp_dir.join("image.iso");
+        std::fs::write(&img_path, vec![0u8; 1024]).unwrap();
+
+        let executor = Arc::new(CountingExecutor::default());
+        let bridge = GuiBridge::with_executor(
+            Weak::default(),
+            scanner,
+            Arc::new(MockFilePicker::new()),
+            executor.clone(),
+        );
+
+        bridge.scan_and_update_ui();
+        bridge.apply_image_path(img_path);
+        bridge.handle_select_drive_by_path(Path::new("/dev/sdb"));
+
+        // Rapid double invocation of handle_flash
+        bridge.handle_flash();
+        bridge.handle_flash();
+
+        // Must only launch executor ONCE
+        assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_drive_poller_pauses_mutations_while_flashing() {
+        let scanner = Arc::new(inscribe_core::drive::MockDriveScanner::empty());
+        let drive = DriveInfo {
+            path: PathBuf::from("/dev/sdb"),
+            model: "USB Drive".to_string(),
+            vendor: "Vendor".to_string(),
+            size: 8_000_000_000,
+            sector_size: 512,
+            bus_type: inscribe_core::drive::BusType::Usb,
+            is_removable: true,
+            is_read_only: false,
+            is_system: false,
+            mount_points: vec![],
+        };
+        scanner.add_drive(drive);
+
+        let bridge = GuiBridge::with_executor(
+            Weak::default(),
+            scanner,
+            Arc::new(MockFilePicker::new()),
+            Arc::new(CountingExecutor::default()),
+        );
+
+        bridge.scan_and_update_ui();
+        bridge.handle_select_drive_by_path(Path::new("/dev/sdb"));
+        assert!(bridge.state().lock().unwrap().selected_drive().is_some());
+
+        // Set flashing to true
+        bridge.state().lock().unwrap().set_is_flashing(true);
+
+        // Apply an update where drives list is empty (e.g. drive removal event)
+        bridge.apply_drive_update(vec![]);
+
+        // Drive list mutations must be paused; selected_drive must NOT be cleared
+        assert!(
+            bridge.state().lock().unwrap().selected_drive().is_some(),
+            "Selected drive must not be removed while is_flashing is true"
+        );
+        assert_eq!(
+            bridge.state().lock().unwrap().drives().len(),
+            1,
+            "Drives list must not be wiped while is_flashing is true"
+        );
+    }
+
+    #[test]
+    fn test_real_flash_executor_rejects_system_drive() {
+        let sys_drive = DriveInfo {
+            path: PathBuf::from("/dev/nvme0n1"),
+            model: "System NVMe".to_string(),
+            vendor: "Samsung".to_string(),
+            size: 500_000_000_000,
+            sector_size: 512,
+            bus_type: inscribe_core::drive::BusType::Nvme,
+            is_removable: false,
+            is_read_only: false,
+            is_system: true,
+            mount_points: vec![PathBuf::from("/")],
+        };
+
+        let temp_dir = std::env::temp_dir().join(format!("test_real_exec_{}", std::process::id()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let img_path = temp_dir.join("image.iso");
+        std::fs::write(&img_path, vec![0u8; 1024]).unwrap();
+
+        let executor = RealFlashExecutor::new();
+        let res = executor.start_flash(&img_path, &sys_drive, false);
+        match res {
+            Err(InscribeError::DriveGuardViolation { .. }) => (),
+            _ => panic!("Expected DriveGuardViolation"),
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

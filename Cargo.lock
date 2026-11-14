@@ -2312,6 +2312,7 @@ version = "0.1.0"
 dependencies = [
  "crossbeam-channel",
  "inscribe-core",
+ "libc",
  "rfd",
  "slint",
  "tracing",
