@@ -53,7 +53,6 @@ slint = { version = "1.18.1", default-features = false, features = [
     "backend-winit-x11",
     "renderer-software",
 ] }
-slint-build = "1.18.1"
 swash = "0.1.19"
 
 # Native File Dialog

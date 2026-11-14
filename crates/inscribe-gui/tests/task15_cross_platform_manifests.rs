@@ -271,3 +271,46 @@ fn test_macos_bundle_plist_and_dmg_configuration() {
         "create-dmg.sh must use hdiutil create or create-dmg to generate Inscribe.dmg"
     );
 }
+
+#[test]
+fn test_cross_platform_toolchain_and_workspace_dependency_hygiene() {
+    let root = workspace_root();
+
+    // 1. Verify .cargo/config.toml scopes target settings to Linux x86_64, not cfg(all())
+    let cargo_config_path = root.join(".cargo/config.toml");
+    assert!(cargo_config_path.exists(), ".cargo/config.toml must exist");
+    let config_content =
+        fs::read_to_string(&cargo_config_path).expect("Failed to read .cargo/config.toml");
+
+    assert!(
+        !config_content.contains("cfg(all())"),
+        ".cargo/config.toml must never use cfg(all()) for platform-specific linker settings"
+    );
+    assert!(
+        config_content.contains("[target.x86_64-unknown-linux-gnu]"),
+        ".cargo/config.toml must scope target configurations strictly to [target.x86_64-unknown-linux-gnu]"
+    );
+
+    // 2. Verify root Cargo.toml does not contain unused slint-build dependency
+    let root_cargo_path = root.join("Cargo.toml");
+    let root_cargo_content =
+        fs::read_to_string(&root_cargo_path).expect("Failed to read Cargo.toml");
+
+    assert!(
+        !root_cargo_content.contains("slint-build"),
+        "Root Cargo.toml workspace.dependencies must not contain unused slint-build"
+    );
+
+    // 3. Verify .cargo/ld-wrapper.sh handles missing objcopy and supports $CC / gcc
+    let ld_wrapper_path = root.join(".cargo/ld-wrapper.sh");
+    assert!(ld_wrapper_path.exists(), ".cargo/ld-wrapper.sh must exist");
+    let wrapper_content =
+        fs::read_to_string(&ld_wrapper_path).expect("Failed to read .cargo/ld-wrapper.sh");
+    assert!(
+        wrapper_content.contains("${CC:-")
+            || wrapper_content.contains("command -v objcopy")
+            || wrapper_content.contains("which objcopy")
+            || wrapper_content.contains("type objcopy"),
+        ".cargo/ld-wrapper.sh must safely check objcopy availability and fallback to CC/gcc"
+    );
+}
