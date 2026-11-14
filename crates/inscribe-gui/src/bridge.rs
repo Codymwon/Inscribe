@@ -41,12 +41,11 @@ pub fn validate_dropped_file(path: &Path) -> Result<(), InscribeError> {
     let has_supported_ext = path
         .extension()
         .and_then(|ext| ext.to_str())
-        .map(|ext| {
+        .is_some_and(|ext| {
             SUPPORTED_IMAGE_EXTENSIONS
                 .iter()
                 .any(|&supported| supported.eq_ignore_ascii_case(ext))
-        })
-        .unwrap_or(false);
+        });
 
     if !has_supported_ext {
         return Err(InscribeError::Other(format!(
@@ -143,6 +142,20 @@ impl RealFlashExecutor {
     }
 }
 
+fn open_and_inspect_image(
+    path: &Path,
+) -> Result<(File, inscribe_core::image::ImageMetadata), InscribeError> {
+    let mut file = File::open(path).map_err(InscribeError::Io)?;
+    let mut header = [0u8; 4096];
+    let bytes_read = file.read(&mut header).unwrap_or(0);
+    let format = detect_format(&header[..bytes_read], Some(path));
+    file.seek(SeekFrom::Start(0)).map_err(InscribeError::Io)?;
+
+    let metadata = inspect_image(&mut file, format, Some(path))?;
+    file.seek(SeekFrom::Start(0)).map_err(InscribeError::Io)?;
+    Ok((file, metadata))
+}
+
 impl FlashExecutor for RealFlashExecutor {
     fn start_flash(
         &self,
@@ -153,23 +166,18 @@ impl FlashExecutor for RealFlashExecutor {
         // Platform volume unmounting and exclusive lock acquisition prior to opening raw block writers
         inscribe_core::drive::prepare_drive_for_writing(drive, allow_external_usb_ssd)?;
 
-        let mut file = File::open(image_path).map_err(InscribeError::Io)?;
-        let mut header = [0u8; 4096];
-        let bytes_read = file.read(&mut header).unwrap_or(0);
-        let format = detect_format(&header[..bytes_read], Some(image_path));
-        file.seek(SeekFrom::Start(0)).map_err(InscribeError::Io)?;
+        let (file, metadata) = open_and_inspect_image(image_path)?;
+        let reader = open_seekable_decompressor(file, metadata.format)?;
 
-        let metadata = inspect_image(&mut file, format, Some(image_path))?;
-        file.seek(SeekFrom::Start(0)).map_err(InscribeError::Io)?;
-
-        let reader = open_seekable_decompressor(file, format)?;
-
-        let direct_opts = WriterOptions::direct();
-        let buffered_opts = WriterOptions::buffered();
-        let target = BlockDeviceWriter::open_drive(drive, &direct_opts, allow_external_usb_ssd)
-            .or_else(|_| {
-                BlockDeviceWriter::open_drive(drive, &buffered_opts, allow_external_usb_ssd)
-            })?;
+        let target =
+            BlockDeviceWriter::open_drive(drive, &WriterOptions::direct(), allow_external_usb_ssd)
+                .or_else(|_| {
+                    BlockDeviceWriter::open_drive(
+                        drive,
+                        &WriterOptions::buffered(),
+                        allow_external_usb_ssd,
+                    )
+                })?;
 
         let options = PipelineOptions {
             expected_size: metadata.uncompressed_size,
@@ -308,20 +316,15 @@ pub fn parse_file_drop_uri(raw: &str) -> PathBuf {
     let trimmed = raw.trim();
 
     // 1. Strip file scheme prefix
-    let without_scheme = if let Some(stripped) = trimmed.strip_prefix("file://") {
-        stripped
-    } else if let Some(stripped) = trimmed.strip_prefix("FILE://") {
-        stripped
-    } else {
-        trimmed
-    };
+    let without_scheme = trimmed
+        .strip_prefix("file://")
+        .or_else(|| trimmed.strip_prefix("FILE://"))
+        .unwrap_or(trimmed);
 
     // 2. Handle localhost authority: file://localhost/path
-    let without_host = if let Some(stripped) = without_scheme.strip_prefix("localhost") {
-        stripped
-    } else {
-        without_scheme
-    };
+    let without_host = without_scheme
+        .strip_prefix("localhost")
+        .unwrap_or(without_scheme);
 
     // 3. Percent-decode
     let decoded = decode_percent_encoded(without_host);
@@ -348,12 +351,11 @@ fn decode_percent_encoded(input: &str) -> String {
             let h1 = iter.next();
             let h2 = iter.next();
             if let (Some(h1), Some(h2)) = (h1, h2) {
-                let hex_pair = [h1, h2];
-                if let Ok(hex_str) = std::str::from_utf8(&hex_pair) {
-                    if let Ok(val) = u8::from_str_radix(hex_str, 16) {
-                        bytes.push(val);
-                        continue;
-                    }
+                if let Ok(val) =
+                    u8::from_str_radix(std::str::from_utf8(&[h1, h2]).unwrap_or(""), 16)
+                {
+                    bytes.push(val);
+                    continue;
                 }
                 bytes.push(b'%');
                 bytes.push(h1);
@@ -439,6 +441,50 @@ impl GuiBridge {
         self.state.clone()
     }
 
+    fn update_window<F>(&self, f: F)
+    where
+        F: FnOnce(AppWindow) + Send + 'static,
+    {
+        if let Some(win) = self.window.upgrade() {
+            f(win);
+        } else {
+            let _ = self.window.upgrade_in_event_loop(f);
+        }
+    }
+
+    fn pause_poller(&self) {
+        if let Ok(lock) = self.poller.lock() {
+            if let Some(ref p) = *lock {
+                p.pause();
+            }
+        }
+    }
+
+    fn resume_poller(&self) {
+        if let Ok(lock) = self.poller.lock() {
+            if let Some(ref p) = *lock {
+                p.resume();
+            }
+        }
+    }
+
+    fn attest_target_drive(&self, drive: &DriveInfo, allow_ssd: bool) -> Result<(), InscribeError> {
+        let live_drives = self.scanner.scan_drives()?;
+        let live_drive = live_drives
+            .iter()
+            .find(|d| d.path == drive.path)
+            .ok_or_else(|| {
+                InscribeError::drive_guard_violation(
+                    &drive.path,
+                    format!(
+                        "Target device '{}' disappeared between initial scan and write attempt",
+                        drive.path.display()
+                    ),
+                )
+            })?;
+        inscribe_core::drive::guard::DriveGuard::attest_target(drive, live_drive, allow_ssd)
+    }
+
     /// Starts background hotplug drive polling at the specified interval.
     pub fn start_polling(self: &Arc<Self>, interval: Duration) {
         let bridge_weak = Arc::downgrade(self);
@@ -446,11 +492,7 @@ impl GuiBridge {
 
         let poller = DrivePoller::start(scanner, interval, move |drives| {
             if let Some(bridge) = bridge_weak.upgrade() {
-                let is_flashing = bridge
-                    .state
-                    .lock()
-                    .map(|s| s.is_flashing())
-                    .unwrap_or(false);
+                let is_flashing = bridge.state.lock().is_ok_and(|s| s.is_flashing());
                 if !is_flashing {
                     let bridge_inner = bridge.clone();
                     let _ = bridge.window.upgrade_in_event_loop(move |_| {
@@ -515,7 +557,7 @@ impl GuiBridge {
 
         let drive_count = drives.len() as i32;
 
-        let apply_to_win = move |win: AppWindow| {
+        self.update_window(move |win: AppWindow| {
             win.set_drive_count(drive_count);
             win.set_drives(ModelRc::new(VecModel::from(items)));
             win.set_allow_external_usb_ssd(allow_ssd);
@@ -541,13 +583,7 @@ impl GuiBridge {
                     win.set_can_flash(can_flash);
                 }
             }
-        };
-
-        if let Some(win) = self.window.upgrade() {
-            apply_to_win(win);
-        } else {
-            let _ = self.window.upgrade_in_event_loop(apply_to_win);
-        }
+        });
     }
 
     /// Handles clicking the "Select Image" button by triggering the file dialog.
@@ -560,20 +596,17 @@ impl GuiBridge {
     /// Handles a drag-and-dropped file URI or path.
     pub fn handle_file_dropped(&self, path_str: &str) {
         let path = parse_file_drop_uri(path_str);
-        match validate_dropped_file(&path) {
-            Ok(()) => {
-                self.apply_image_path(path);
-            }
-            Err(e) => {
-                error!(path = %path.display(), error = %e, "Invalid file dropped");
-                let title = if e.to_string().contains("supported disk image extension") {
-                    "Unsupported File Format"
-                } else {
-                    "Invalid Image File"
-                };
-                self.apply_ui_error(title, e.to_string());
-            }
+        if let Err(e) = validate_dropped_file(&path) {
+            error!(path = %path.display(), error = %e, "Invalid file dropped");
+            let title = if e.to_string().contains("supported disk image extension") {
+                "Unsupported File Format"
+            } else {
+                "Invalid Image File"
+            };
+            self.apply_ui_error(title, e.to_string());
+            return;
         }
+        self.apply_image_path(path);
     }
 
     /// Inspects and applies an image path, updating internal state and Slint properties.
@@ -592,18 +625,13 @@ impl GuiBridge {
         match result {
             Ok((image, can_flash)) => {
                 info!(image_name = %image.name, size = image.size, "Disk image selected successfully");
-                let apply_to_win = move |win: AppWindow| {
+                self.update_window(move |win: AppWindow| {
                     win.set_image_selected(true);
                     win.set_image_name(SharedString::from(image.name));
                     win.set_image_size_text(SharedString::from(image.formatted_size));
                     win.set_image_format_badge(SharedString::from(image.format_name));
                     win.set_can_flash(can_flash);
-                };
-                if let Some(win) = self.window.upgrade() {
-                    apply_to_win(win);
-                } else {
-                    let _ = self.window.upgrade_in_event_loop(apply_to_win);
-                }
+                });
             }
             Err(e) => {
                 error!(error = %e, "Failed to inspect selected image");
@@ -618,44 +646,41 @@ impl GuiBridge {
             Err(_) => return,
         };
 
-        if state.select_drive(path) {
-            let drive = state.selected_drive().cloned().unwrap();
-            let can_flash = state.can_flash();
-            let name_formatted = format_drive_display_name(&drive);
-            let size_text = drive.formatted_size();
-
-            // Find matching index in drives list
-            let index = state
-                .drives()
-                .iter()
-                .position(|d| d.path == drive.path)
-                .map(|i| i as i32)
-                .unwrap_or(-1);
-
-            let apply_to_win = move |win: AppWindow| {
-                win.set_drive_selected(true);
-                win.set_drive_name(SharedString::from(name_formatted.trim()));
-                win.set_drive_size_text(SharedString::from(size_text));
-                win.set_selected_drive_index(index);
-                win.set_can_flash(can_flash);
-            };
-            if let Some(win) = self.window.upgrade() {
-                apply_to_win(win);
-            } else {
-                let _ = self.window.upgrade_in_event_loop(apply_to_win);
-            }
+        if !state.select_drive(path) {
+            return;
         }
+
+        let Some(drive) = state.selected_drive().cloned() else {
+            return;
+        };
+        let can_flash = state.can_flash();
+        let name_formatted = format_drive_display_name(&drive);
+        let size_text = drive.formatted_size();
+
+        // Find matching index in drives list
+        let index = state
+            .drives()
+            .iter()
+            .position(|d| d.path == drive.path)
+            .map(|i| i as i32)
+            .unwrap_or(-1);
+
+        self.update_window(move |win: AppWindow| {
+            win.set_drive_selected(true);
+            win.set_drive_name(SharedString::from(name_formatted.trim()));
+            win.set_drive_size_text(SharedString::from(size_text));
+            win.set_selected_drive_index(index);
+            win.set_can_flash(can_flash);
+        });
     }
 
     /// Selects a target drive by its index in the current drives list.
     pub fn handle_select_drive_by_index(&self, index: usize) {
-        let path = {
-            let state = match self.state.lock() {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-            state.drives().get(index).map(|d| d.path.clone())
-        };
+        let path = self
+            .state
+            .lock()
+            .ok()
+            .and_then(|s| s.drives().get(index).map(|d| d.path.clone()));
 
         if let Some(path) = path {
             self.handle_select_drive_by_path(&path);
@@ -692,16 +717,13 @@ impl GuiBridge {
                 return;
             }
 
-            let image_path = match state.selected_image() {
-                Some(img) => img.path.clone(),
-                None => return,
+            let Some(img) = state.selected_image() else {
+                return;
             };
-
-            let drive = match state.selected_drive() {
-                Some(d) => d.clone(),
-                None => return,
+            let Some(drive) = state.selected_drive().cloned() else {
+                return;
             };
-
+            let image_path = img.path.clone();
             let allow_ssd = state.allow_external_usb_ssd();
 
             // Atomically flag is_flashing under initial lock to drop concurrent invocations
@@ -711,71 +733,16 @@ impl GuiBridge {
         };
 
         // Pause drive hotplug poller during flashing
-        if let Ok(lock) = self.poller.lock() {
-            if let Some(ref p) = *lock {
-                p.pause();
-            }
-        }
+        self.pause_poller();
 
         // Live target attestation (prevent TOCTOU device swap races)
-        let live_drives = match self.scanner.scan_drives() {
-            Ok(d) => d,
-            Err(e) => {
-                error!(error = %e, "Failed to scan drives for pre-flash attestation");
-                if let Ok(mut state) = self.state.lock() {
-                    state.set_is_flashing(false);
-                }
-                if let Ok(lock) = self.poller.lock() {
-                    if let Some(ref p) = *lock {
-                        p.resume();
-                    }
-                }
-                self.apply_flash_error(&e);
-                return;
-            }
-        };
-
-        let live_drive = match live_drives.iter().find(|d| d.path == drive.path) {
-            Some(d) => d,
-            None => {
-                let err = InscribeError::drive_guard_violation(
-                    &drive.path,
-                    format!(
-                        "Target device '{}' disappeared between initial scan and write attempt",
-                        drive.path.display()
-                    ),
-                );
-                error!(error = %err, "Target device missing during pre-flash attestation");
-                if let Ok(mut state) = self.state.lock() {
-                    state.set_is_flashing(false);
-                }
-                if let Ok(lock) = self.poller.lock() {
-                    if let Some(ref p) = *lock {
-                        p.resume();
-                    }
-                }
-                self.apply_flash_error(&err);
-                return;
-            }
-        };
-
-        if let Err(err) =
-            inscribe_core::drive::guard::DriveGuard::attest_target(&drive, live_drive, allow_ssd)
-        {
-            error!(error = %err, "Pre-flash Drive Guard attestation failed");
-            if let Ok(mut state) = self.state.lock() {
-                state.set_is_flashing(false);
-            }
-            if let Ok(lock) = self.poller.lock() {
-                if let Some(ref p) = *lock {
-                    p.resume();
-                }
-            }
+        if let Err(err) = self.attest_target_drive(&drive, allow_ssd) {
+            error!(error = %err, "Pre-flash target attestation failed");
             self.apply_flash_error(&err);
             return;
         }
 
-        let apply_to_win = |win: AppWindow| {
+        self.update_window(|win| {
             win.set_is_flashing(true);
             win.set_flash_progress(0.0);
             win.set_flash_phase_text(SharedString::from("Initializing..."));
@@ -784,13 +751,7 @@ impl GuiBridge {
             win.set_show_cancel_modal(false);
             win.set_show_success_screen(false);
             win.set_show_error_screen(false);
-        };
-
-        if let Some(win) = self.window.upgrade() {
-            apply_to_win(win);
-        } else {
-            let _ = self.window.upgrade_in_event_loop(apply_to_win);
-        }
+        });
 
         let handle = match self
             .flash_executor
@@ -799,21 +760,13 @@ impl GuiBridge {
             Ok(h) => h,
             Err(e) => {
                 error!(error = %e, "Failed to launch flash worker");
-                if let Ok(mut state) = self.state.lock() {
-                    state.set_is_flashing(false);
-                }
-                if let Ok(lock) = self.poller.lock() {
-                    if let Some(ref p) = *lock {
-                        p.resume();
-                    }
-                }
                 self.apply_flash_error(&e);
                 return;
             }
         };
 
-        let progress_rx_for_bridge = handle.progress_rx.clone();
-        let cancel_token_clone = handle.cancel_token.clone();
+        let progress_rx = handle.progress_rx.clone();
+        let cancel_token = handle.cancel_token.clone();
 
         if let Ok(mut state) = self.state.lock() {
             state.set_cancel_token(Some(handle.cancel_token.clone()));
@@ -821,7 +774,7 @@ impl GuiBridge {
 
         if let Ok(mut lock) = self.active_flash.lock() {
             *lock = Some(ActiveFlash {
-                cancel_token: cancel_token_clone,
+                cancel_token,
                 progress_rx: handle.progress_rx,
                 thread_handle: Some(handle.thread_handle),
                 completed_result: None,
@@ -832,47 +785,38 @@ impl GuiBridge {
         std::thread::Builder::new()
             .name("inscribe-telemetry-bridge".to_string())
             .spawn(move || {
-                while let Ok(progress) = progress_rx_for_bridge.recv() {
-                    if let Some(bridge) = bridge_weak.upgrade() {
-                        let bridge_prog = bridge.clone();
-                        let _ = bridge.window.upgrade_in_event_loop(move |_| {
-                            bridge_prog.apply_flash_progress(&progress);
-                        });
-                    } else {
+                while let Ok(progress) = progress_rx.recv() {
+                    let Some(bridge) = bridge_weak.upgrade() else {
                         break;
-                    }
+                    };
+                    let bridge_prog = bridge.clone();
+                    let _ = bridge.window.upgrade_in_event_loop(move |_| {
+                        bridge_prog.apply_flash_progress(&progress);
+                    });
                 }
 
-                let bridge = match bridge_weak.upgrade() {
-                    Some(b) => b,
-                    None => return,
+                let Some(bridge) = bridge_weak.upgrade() else {
+                    return;
                 };
 
                 // Channel disconnected -> worker finished.
                 // Join worker thread handle on this background worker thread to eliminate
                 // any OS thread cleanup race condition before updating UI state.
-                let handle_opt = {
-                    if let Ok(mut lock) = bridge.active_flash.lock() {
-                        if let Some(ref mut active) = *lock {
-                            active.thread_handle.take()
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                };
+                let handle_opt = bridge
+                    .active_flash
+                    .lock()
+                    .ok()
+                    .and_then(|mut lock| lock.as_mut().and_then(|a| a.thread_handle.take()));
 
-                let result = if let Some(handle) = handle_opt {
-                    match handle.join() {
-                        Ok(res) => res,
-                        Err(_) => Err(InscribeError::Other(
-                            "Flash worker thread panicked".to_string(),
-                        )),
-                    }
-                } else {
+                let Some(handle) = handle_opt else {
                     return;
                 };
+
+                let result = handle.join().unwrap_or_else(|_| {
+                    Err(InscribeError::Other(
+                        "Flash worker thread panicked".to_string(),
+                    ))
+                });
 
                 if let Ok(mut lock) = bridge.active_flash.lock() {
                     if let Some(ref mut active) = *lock {
@@ -893,54 +837,48 @@ impl GuiBridge {
     /// Updates Slint properties synchronously on the calling thread.
     /// Returns `true` if the operation has completed or was cancelled.
     pub fn poll_active_flash(&self) -> bool {
-        let result_opt = {
-            let mut lock = match self.active_flash.lock() {
-                Ok(l) => l,
-                Err(_) => return false,
-            };
-            match *lock {
-                Some(ref mut active) => {
-                    let mut latest_progress = None;
-                    while let Ok(p) = active.progress_rx.try_recv() {
-                        latest_progress = Some(p);
-                    }
-                    if let Some(p) = latest_progress {
-                        self.apply_flash_progress(&p);
-                    }
-
-                    if let Some(res) = active.completed_result.take() {
-                        *lock = None;
-                        Some(res)
-                    } else if active
-                        .thread_handle
-                        .as_ref()
-                        .is_some_and(|h| h.is_finished())
-                    {
-                        let h = active.thread_handle.take().unwrap();
-                        *lock = None;
-                        Some(match h.join() {
-                            Ok(r) => r,
-                            Err(_) => Err(InscribeError::Other(
-                                "Flash worker thread panicked".to_string(),
-                            )),
-                        })
-                    } else {
-                        None
-                    }
-                }
-                None => None,
-            }
+        let mut lock = match self.active_flash.lock() {
+            Ok(l) => l,
+            Err(_) => return false,
+        };
+        let Some(ref mut active) = *lock else {
+            return false;
         };
 
-        if let Some(result) = result_opt {
-            match result {
-                Ok(summary) => self.apply_flash_success(&summary),
-                Err(err) => self.apply_flash_error(&err),
-            }
-            return true;
+        // Drain pending progress updates and apply the latest
+        let mut latest_progress = None;
+        while let Ok(p) = active.progress_rx.try_recv() {
+            latest_progress = Some(p);
+        }
+        if let Some(p) = latest_progress {
+            self.apply_flash_progress(&p);
         }
 
-        false
+        let result = if let Some(res) = active.completed_result.take() {
+            *lock = None;
+            res
+        } else if active
+            .thread_handle
+            .as_ref()
+            .is_some_and(|h| h.is_finished())
+        {
+            let handle = active.thread_handle.take().unwrap();
+            *lock = None;
+            handle.join().unwrap_or_else(|_| {
+                Err(InscribeError::Other(
+                    "Flash worker thread panicked".to_string(),
+                ))
+            })
+        } else {
+            return false;
+        };
+        drop(lock);
+
+        match result {
+            Ok(summary) => self.apply_flash_success(&summary),
+            Err(err) => self.apply_flash_error(&err),
+        }
+        true
     }
 
     /// Dispatches telemetry updates to the Slint UI.
@@ -978,18 +916,12 @@ impl GuiBridge {
 
         let progress_val = progress.fraction.unwrap_or(0.0);
 
-        let apply_to_win = move |win: AppWindow| {
+        self.update_window(move |win: AppWindow| {
             win.set_flash_progress(progress_val);
             win.set_flash_phase_text(SharedString::from(phase_text));
             win.set_flash_speed_text(SharedString::from(speed_text));
             win.set_flash_eta_text(SharedString::from(eta_text));
-        };
-
-        if let Some(win) = self.window.upgrade() {
-            apply_to_win(win);
-        } else {
-            let _ = self.window.upgrade_in_event_loop(apply_to_win);
-        }
+        });
     }
 
     /// Transitions the UI to the celebration screen upon successful flash and verification.
@@ -997,55 +929,39 @@ impl GuiBridge {
         if let Ok(mut state) = self.state.lock() {
             state.set_is_flashing(false);
         }
-        if let Ok(lock) = self.poller.lock() {
-            if let Some(ref p) = *lock {
-                p.resume();
-            }
-        }
+        self.resume_poller();
 
-        let summary_text = format!(
+        let summary_text = SharedString::from(format!(
             "{} written at {:.1} MB/s ({})",
             format_bytes(summary.bytes_written),
             summary.average_mb_per_sec,
             format_duration(summary.duration),
-        );
-        let hash_text = format!("BLAKE3 Checksum: {}", summary.blake3_hash);
+        ));
+        let hash_text = SharedString::from(format!("BLAKE3 Checksum: {}", summary.blake3_hash));
 
-        let apply_to_win = move |win: AppWindow| {
+        self.update_window(move |win: AppWindow| {
             win.set_is_flashing(false);
             win.set_flash_progress(1.0);
             win.set_show_cancel_modal(false);
             win.set_show_error_screen(false);
             win.set_show_success_screen(true);
-            win.set_success_summary_text(SharedString::from(summary_text));
-            win.set_success_hash_text(SharedString::from(hash_text));
-        };
-
-        if let Some(win) = self.window.upgrade() {
-            apply_to_win(win);
-        } else {
-            let _ = self.window.upgrade_in_event_loop(apply_to_win);
-        }
+            win.set_success_summary_text(summary_text);
+            win.set_success_hash_text(hash_text);
+        });
     }
 
     /// Transitions the UI to display an error screen with specified title and message.
     pub fn apply_ui_error(&self, title: impl Into<String>, message: impl Into<String>) {
-        let title = title.into();
-        let message = message.into();
-        let apply_to_win = move |win: AppWindow| {
+        let title = SharedString::from(title.into());
+        let message = SharedString::from(message.into());
+        self.update_window(move |win: AppWindow| {
             win.set_is_flashing(false);
             win.set_show_cancel_modal(false);
             win.set_show_success_screen(false);
             win.set_show_error_screen(true);
-            win.set_error_title_text(SharedString::from(title));
-            win.set_error_message_text(SharedString::from(message));
-        };
-
-        if let Some(win) = self.window.upgrade() {
-            apply_to_win(win);
-        } else {
-            let _ = self.window.upgrade_in_event_loop(apply_to_win);
-        }
+            win.set_error_title_text(title);
+            win.set_error_message_text(message);
+        });
     }
 
     /// Transitions the UI to the error summary screen with actionable failure details.
@@ -1053,11 +969,7 @@ impl GuiBridge {
         if let Ok(mut state) = self.state.lock() {
             state.set_is_flashing(false);
         }
-        if let Ok(lock) = self.poller.lock() {
-            if let Some(ref p) = *lock {
-                p.resume();
-            }
-        }
+        self.resume_poller();
 
         let (title, message) = match err {
             InscribeError::Cancelled => (
@@ -1100,38 +1012,17 @@ impl GuiBridge {
 
     /// Shows the cancellation confirmation modal dialog.
     pub fn handle_cancel_flash_requested(&self) {
-        let apply_to_win = |win: AppWindow| {
-            win.set_show_cancel_modal(true);
-        };
-        if let Some(win) = self.window.upgrade() {
-            apply_to_win(win);
-        } else {
-            let _ = self.window.upgrade_in_event_loop(apply_to_win);
-        }
+        self.update_window(|win| win.set_show_cancel_modal(true));
     }
 
     /// Dismisses the cancellation confirmation modal without halting flashing.
     pub fn handle_dismiss_cancel_modal(&self) {
-        let apply_to_win = |win: AppWindow| {
-            win.set_show_cancel_modal(false);
-        };
-        if let Some(win) = self.window.upgrade() {
-            apply_to_win(win);
-        } else {
-            let _ = self.window.upgrade_in_event_loop(apply_to_win);
-        }
+        self.update_window(|win| win.set_show_cancel_modal(false));
     }
 
     /// Confirms cancellation and signals the active worker to halt immediately.
     pub fn handle_confirm_cancel(&self) {
-        let apply_to_win = |win: AppWindow| {
-            win.set_show_cancel_modal(false);
-        };
-        if let Some(win) = self.window.upgrade() {
-            apply_to_win(win);
-        } else {
-            let _ = self.window.upgrade_in_event_loop(apply_to_win);
-        }
+        self.update_window(|win| win.set_show_cancel_modal(false));
 
         if let Ok(state) = self.state.lock() {
             state.cancel_active_flash();
@@ -1146,141 +1037,87 @@ impl GuiBridge {
 
     /// Dismisses either the celebration screen or error screen, returning to main UI.
     pub fn handle_dismiss_result(&self) {
-        let apply_to_win = |win: AppWindow| {
+        self.update_window(|win| {
             win.set_show_success_screen(false);
             win.set_show_error_screen(false);
-        };
-        if let Some(win) = self.window.upgrade() {
-            apply_to_win(win);
-        } else {
-            let _ = self.window.upgrade_in_event_loop(apply_to_win);
-        }
+        });
     }
 
     /// Connects all UI callbacks on the provided `AppWindow` to this bridge instance.
     pub fn wire_callbacks(self: &Arc<Self>, window: &AppWindow) {
         // Step 1: Select Image
-        {
-            let bridge = self.clone();
-            window.on_select_image_clicked(move || {
-                bridge.handle_select_image();
-            });
-        }
+        let b = self.clone();
+        window.on_select_image_clicked(move || b.handle_select_image());
 
         // File drop
-        {
-            let bridge = self.clone();
-            window.on_file_dropped(move |path| {
-                bridge.handle_file_dropped(&path);
-            });
-        }
+        let b = self.clone();
+        window.on_file_dropped(move |path| b.handle_file_dropped(&path));
 
         // Data transfer unpacker for file drops
-        {
-            window.on_data_to_uri(|data| {
-                if let Ok(mut paths) = data.file_paths() {
-                    if let Some(path) = paths.next() {
-                        return SharedString::from(path.to_string_lossy().as_ref());
-                    }
+        window.on_data_to_uri(|data| {
+            if let Ok(mut paths) = data.file_paths() {
+                if let Some(path) = paths.next() {
+                    return SharedString::from(path.to_string_lossy().as_ref());
                 }
-                if let Ok(text) = data.plain_text() {
-                    return text;
-                }
-                SharedString::default()
-            });
-        }
+            }
+            data.plain_text().unwrap_or_default()
+        });
 
         // Step 2: Select Drive (opens selection modal)
-        {
-            let weak_win = window.as_weak();
-            let bridge = self.clone();
-            window.on_select_drive_clicked(move || {
-                // Ensure fresh drive list before opening modal
-                bridge.scan_and_update_ui();
-                let _ = weak_win.upgrade_in_event_loop(|win| {
-                    win.set_show_drive_modal(true);
-                });
-            });
-        }
+        let b = self.clone();
+        let weak_win = window.as_weak();
+        window.on_select_drive_clicked(move || {
+            b.scan_and_update_ui();
+            let _ = weak_win.upgrade_in_event_loop(|win| win.set_show_drive_modal(true));
+        });
 
         // Drive selection from list
-        {
-            let bridge = self.clone();
-            window.on_drive_selected_by_index(move |idx| {
-                if idx >= 0 {
-                    bridge.handle_select_drive_by_index(idx as usize);
-                }
-            });
-        }
+        let b = self.clone();
+        window.on_drive_selected_by_index(move |idx| {
+            if idx >= 0 {
+                b.handle_select_drive_by_index(idx as usize);
+            }
+        });
 
         // Manual refresh button in modal
-        {
-            let bridge = self.clone();
-            window.on_refresh_drives_clicked(move || {
-                bridge.scan_and_update_ui();
-            });
-        }
+        let b = self.clone();
+        window.on_refresh_drives_clicked(move || b.scan_and_update_ui());
 
         // USB SSD safety setting modal toggle
-        {
-            let bridge = self.clone();
-            let weak_win = window.as_weak();
-            window.on_toggle_usb_ssd_modal_clicked(move || {
-                let bridge_inner = bridge.clone();
-                let _ = weak_win.upgrade_in_event_loop(move |win| {
-                    let current = win.get_allow_external_usb_ssd();
-                    bridge_inner.handle_toggle_allow_external_usb_ssd(current);
-                });
+        let b = self.clone();
+        let weak_win = window.as_weak();
+        window.on_toggle_usb_ssd_modal_clicked(move || {
+            let b_inner = b.clone();
+            let _ = weak_win.upgrade_in_event_loop(move |win| {
+                b_inner.handle_toggle_allow_external_usb_ssd(win.get_allow_external_usb_ssd());
             });
-        }
+        });
 
         // Allow External USB SSD checkbox changed
-        {
-            let bridge = self.clone();
-            window.on_allow_external_usb_ssd_changed(move |allow| {
-                bridge.handle_toggle_allow_external_usb_ssd(allow);
-            });
-        }
+        let b = self.clone();
+        window.on_allow_external_usb_ssd_changed(move |allow| {
+            b.handle_toggle_allow_external_usb_ssd(allow);
+        });
 
         // Step 3: Flash! Button clicked
-        {
-            let bridge = self.clone();
-            window.on_flash_clicked(move || {
-                bridge.handle_flash();
-            });
-        }
+        let b = self.clone();
+        window.on_flash_clicked(move || b.handle_flash());
 
         // Cancel flashing button clicked (prompts confirmation modal)
-        {
-            let bridge = self.clone();
-            window.on_cancel_flash_clicked(move || {
-                bridge.handle_cancel_flash_requested();
-            });
-        }
+        let b = self.clone();
+        window.on_cancel_flash_clicked(move || b.handle_cancel_flash_requested());
 
         // Confirm cancellation in modal
-        {
-            let bridge = self.clone();
-            window.on_confirm_cancel_clicked(move || {
-                bridge.handle_confirm_cancel();
-            });
-        }
+        let b = self.clone();
+        window.on_confirm_cancel_clicked(move || b.handle_confirm_cancel());
 
         // Dismiss cancellation modal
-        {
-            let bridge = self.clone();
-            window.on_dismiss_cancel_modal_clicked(move || {
-                bridge.handle_dismiss_cancel_modal();
-            });
-        }
+        let b = self.clone();
+        window.on_dismiss_cancel_modal_clicked(move || b.handle_dismiss_cancel_modal());
 
         // Dismiss celebration or error screen
-        {
-            let bridge = self.clone();
-            window.on_dismiss_result_clicked(move || {
-                bridge.handle_dismiss_result();
-            });
-        }
+        let b = self.clone();
+        window.on_dismiss_result_clicked(move || b.handle_dismiss_result());
     }
 }
 
