@@ -239,10 +239,80 @@ pub fn format_drive_display_name(drive: &DriveInfo) -> String {
     format!("{} ({})", base.trim(), drive.path.display())
 }
 
+/// Decodes URL percent-encoding (e.g. `%20` -> `' '`) and normalizes `file://` URIs.
+#[must_use]
+pub fn parse_file_drop_uri(raw: &str) -> PathBuf {
+    let trimmed = raw.trim();
+
+    // 1. Strip file scheme prefix
+    let without_scheme = if let Some(stripped) = trimmed.strip_prefix("file://") {
+        stripped
+    } else if let Some(stripped) = trimmed.strip_prefix("FILE://") {
+        stripped
+    } else {
+        trimmed
+    };
+
+    // 2. Handle localhost authority: file://localhost/path
+    let without_host = if let Some(stripped) = without_scheme.strip_prefix("localhost") {
+        stripped
+    } else {
+        without_scheme
+    };
+
+    // 3. Percent-decode
+    let decoded = decode_percent_encoded(without_host);
+
+    // 4. Normalize Windows drive letters: e.g. "/C:/Users/..." -> "C:/Users/..."
+    let normalized = if decoded.starts_with('/')
+        && decoded.len() >= 3
+        && decoded.as_bytes()[1].is_ascii_alphabetic()
+        && decoded.as_bytes()[2] == b':'
+    {
+        &decoded[1..]
+    } else {
+        &decoded
+    };
+
+    PathBuf::from(normalized)
+}
+
+fn decode_percent_encoded(input: &str) -> String {
+    let mut bytes = Vec::with_capacity(input.len());
+    let mut iter = input.bytes();
+    while let Some(b) = iter.next() {
+        if b == b'%' {
+            let h1 = iter.next();
+            let h2 = iter.next();
+            if let (Some(h1), Some(h2)) = (h1, h2) {
+                let hex_pair = [h1, h2];
+                if let Ok(hex_str) = std::str::from_utf8(&hex_pair) {
+                    if let Ok(val) = u8::from_str_radix(hex_str, 16) {
+                        bytes.push(val);
+                        continue;
+                    }
+                }
+                bytes.push(b'%');
+                bytes.push(h1);
+                bytes.push(h2);
+            } else {
+                bytes.push(b'%');
+                if let Some(h1) = h1 {
+                    bytes.push(h1);
+                }
+            }
+        } else {
+            bytes.push(b);
+        }
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
 struct ActiveFlash {
     cancel_token: Arc<AtomicBool>,
     progress_rx: crossbeam_channel::Receiver<FlashProgress>,
     thread_handle: Option<std::thread::JoinHandle<Result<FlashSummary, InscribeError>>>,
+    completed_result: Option<Result<FlashSummary, InscribeError>>,
 }
 
 /// Central event bridge coordinating Slint UI, hardware scanners, and background workers.
@@ -362,6 +432,7 @@ impl GuiBridge {
         let apply_to_win = move |win: AppWindow| {
             win.set_drive_count(drive_count);
             win.set_drives(ModelRc::new(VecModel::from(items)));
+            win.set_allow_external_usb_ssd(allow_ssd);
 
             match change {
                 DriveStateChange::SelectedDriveRemoved => {
@@ -402,11 +473,7 @@ impl GuiBridge {
 
     /// Handles a drag-and-dropped file URI or path.
     pub fn handle_file_dropped(&self, path_str: &str) {
-        let clean_path = path_str
-            .trim()
-            .strip_prefix("file://")
-            .unwrap_or(path_str.trim());
-        let path = PathBuf::from(clean_path);
+        let path = parse_file_drop_uri(path_str);
         self.apply_image_path(path);
     }
 
@@ -581,6 +648,7 @@ impl GuiBridge {
                 cancel_token: cancel_token_clone,
                 progress_rx: handle.progress_rx,
                 thread_handle: Some(handle.thread_handle),
+                completed_result: None,
             });
         }
 
@@ -592,7 +660,38 @@ impl GuiBridge {
                     bridge.apply_flash_progress(&progress);
                 }
 
-                // Channel disconnected -> worker finished. Finalize on UI thread.
+                // Channel disconnected -> worker finished.
+                // Join worker thread handle on this background worker thread to eliminate
+                // any OS thread cleanup race condition before updating UI state.
+                let handle_opt = {
+                    if let Ok(mut lock) = bridge.active_flash.lock() {
+                        if let Some(ref mut active) = *lock {
+                            active.thread_handle.take()
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                };
+
+                let result = if let Some(handle) = handle_opt {
+                    match handle.join() {
+                        Ok(res) => res,
+                        Err(_) => Err(InscribeError::Other(
+                            "Flash worker thread panicked".to_string(),
+                        )),
+                    }
+                } else {
+                    return;
+                };
+
+                if let Ok(mut lock) = bridge.active_flash.lock() {
+                    if let Some(ref mut active) = *lock {
+                        active.completed_result = Some(result);
+                    }
+                }
+
                 let bridge_inner = bridge.clone();
                 let _ = bridge.window.upgrade_in_event_loop(move |_| {
                     bridge_inner.poll_active_flash();
@@ -606,7 +705,7 @@ impl GuiBridge {
     /// Updates Slint properties synchronously on the calling thread.
     /// Returns `true` if the operation has completed or was cancelled.
     pub fn poll_active_flash(&self) -> bool {
-        let handle_opt = {
+        let result_opt = {
             let mut lock = match self.active_flash.lock() {
                 Ok(l) => l,
                 Err(_) => return false,
@@ -621,14 +720,22 @@ impl GuiBridge {
                         self.apply_flash_progress(&p);
                     }
 
-                    if active
+                    if let Some(res) = active.completed_result.take() {
+                        *lock = None;
+                        Some(res)
+                    } else if active
                         .thread_handle
                         .as_ref()
                         .is_some_and(|h| h.is_finished())
                     {
-                        let h = active.thread_handle.take();
+                        let h = active.thread_handle.take().unwrap();
                         *lock = None;
-                        h
+                        Some(match h.join() {
+                            Ok(r) => r,
+                            Err(_) => Err(InscribeError::Other(
+                                "Flash worker thread panicked".to_string(),
+                            )),
+                        })
                     } else {
                         None
                     }
@@ -637,13 +744,10 @@ impl GuiBridge {
             }
         };
 
-        if let Some(handle) = handle_opt {
-            match handle.join() {
-                Ok(Ok(summary)) => self.apply_flash_success(&summary),
-                Ok(Err(err)) => self.apply_flash_error(&err),
-                Err(_) => self.apply_flash_error(&InscribeError::Other(
-                    "Flash worker thread panicked".to_string(),
-                )),
+        if let Some(result) = result_opt {
+            match result {
+                Ok(summary) => self.apply_flash_success(&summary),
+                Err(err) => self.apply_flash_error(&err),
             }
             return true;
         }
@@ -866,6 +970,21 @@ impl GuiBridge {
             });
         }
 
+        // Data transfer unpacker for file drops
+        {
+            window.on_data_to_uri(|data| {
+                if let Ok(mut paths) = data.file_paths() {
+                    if let Some(path) = paths.next() {
+                        return SharedString::from(path.to_string_lossy().as_ref());
+                    }
+                }
+                if let Ok(text) = data.plain_text() {
+                    return text;
+                }
+                SharedString::default()
+            });
+        }
+
         // Step 2: Select Drive (opens selection modal)
         {
             let weak_win = window.as_weak();
@@ -910,6 +1029,14 @@ impl GuiBridge {
             });
         }
 
+        // Allow External USB SSD checkbox changed
+        {
+            let bridge = self.clone();
+            window.on_allow_external_usb_ssd_changed(move |allow| {
+                bridge.handle_toggle_allow_external_usb_ssd(allow);
+            });
+        }
+
         // Step 3: Flash! Button clicked
         {
             let bridge = self.clone();
@@ -949,5 +1076,48 @@ impl GuiBridge {
                 bridge.handle_dismiss_result();
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_file_drop_uri_percent_decoding_and_normalization() {
+        // Standard unix file URI with percent-encoded spaces
+        let unix_uri = "file:///home/user/Ubuntu%2024.04%20Live.iso";
+        assert_eq!(
+            parse_file_drop_uri(unix_uri),
+            PathBuf::from("/home/user/Ubuntu 24.04 Live.iso")
+        );
+
+        // Windows file URI with leading slash before drive letter
+        let win_uri = "file:///C:/Users/Tester/Downloads/disk%20image.img";
+        assert_eq!(
+            parse_file_drop_uri(win_uri),
+            PathBuf::from("C:/Users/Tester/Downloads/disk image.img")
+        );
+
+        // Localhost URI
+        let localhost_uri = "file://localhost/tmp/tails-os.iso";
+        assert_eq!(
+            parse_file_drop_uri(localhost_uri),
+            PathBuf::from("/tmp/tails-os.iso")
+        );
+
+        // Raw local path without scheme
+        let raw_path = "/var/isos/debian-12.iso";
+        assert_eq!(
+            parse_file_drop_uri(raw_path),
+            PathBuf::from("/var/isos/debian-12.iso")
+        );
+
+        // UTF-8 multibyte percent encoding
+        let utf8_uri = "file:///tmp/%E2%9C%93_image.iso";
+        assert_eq!(
+            parse_file_drop_uri(utf8_uri),
+            PathBuf::from("/tmp/✓_image.iso")
+        );
     }
 }

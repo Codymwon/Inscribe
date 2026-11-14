@@ -332,13 +332,15 @@ fn test_gui_bridge_full_lifecycle_and_slint_reactive_model() {
         "Selected image remains selected"
     );
 
-    // 6. Test File Drop Handling
-    let drop_dir = create_temp_dummy_image("fedora-workstation.img.xz", 512 * 1024);
-    let drop_path = drop_dir.path().join("fedora-workstation.img.xz");
-    let file_uri = format!("file://{}", drop_path.to_str().unwrap());
+    // 6. Test File Drop Handling with URL Percent-Decoding
+    let drop_dir = create_temp_dummy_image("fedora workstation 2026.img.xz", 512 * 1024);
+    let file_uri = format!(
+        "file://{}/fedora%20workstation%202026.img.xz",
+        drop_dir.path().to_str().unwrap()
+    );
     bridge.handle_file_dropped(&file_uri);
     assert!(window.get_image_selected());
-    assert_eq!(window.get_image_name(), "fedora-workstation.img.xz");
+    assert_eq!(window.get_image_name(), "fedora workstation 2026.img.xz");
 
     // 7. Test Select Drive by Index
     let usb2 = sample_removable_drive("/dev/sdd", "Kingston DataTraveler", 64_000_000_000);
@@ -370,6 +372,22 @@ fn test_gui_bridge_full_lifecycle_and_slint_reactive_model() {
     let ssd_item = slint_drives.row_data(2).unwrap();
     assert!(ssd_item.is_flashable);
 
-    // 9. Wire callbacks
+    // 9. Wire callbacks and verify UI callback updates backend AppState
     bridge.wire_callbacks(&window);
+
+    // Toggle back to false via UI callback
+    window.invoke_allow_external_usb_ssd_changed(false);
+    assert!(!bridge.state().lock().unwrap().allow_external_usb_ssd());
+    assert!(!window.get_allow_external_usb_ssd());
+    let slint_drives = window.get_drives();
+    let ssd_item = slint_drives.row_data(2).unwrap();
+    assert!(!ssd_item.is_flashable);
+
+    // Toggle to true via UI callback
+    window.invoke_allow_external_usb_ssd_changed(true);
+    assert!(bridge.state().lock().unwrap().allow_external_usb_ssd());
+    assert!(window.get_allow_external_usb_ssd());
+    let slint_drives = window.get_drives();
+    let ssd_item = slint_drives.row_data(2).unwrap();
+    assert!(ssd_item.is_flashable);
 }

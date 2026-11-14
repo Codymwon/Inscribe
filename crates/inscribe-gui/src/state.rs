@@ -250,13 +250,16 @@ impl AppState {
     }
 }
 
-/// Formats a duration into a human-readable string (e.g. `2m 15s` or `45s`).
+/// Formats a duration into a human-readable string (e.g. `1h 02m 15s`, `2m 15s` or `45s`).
 #[must_use]
 pub fn format_duration(duration: Duration) -> String {
     let total_secs = duration.as_secs();
-    let mins = total_secs / 60;
+    let hours = total_secs / 3600;
+    let mins = (total_secs % 3600) / 60;
     let secs = total_secs % 60;
-    if mins > 0 {
+    if hours > 0 {
+        format!("{hours}h {mins:02}m {secs:02}s")
+    } else if mins > 0 {
         format!("{mins}m {secs:02}s")
     } else {
         format!("{secs}s")
@@ -310,6 +313,9 @@ mod tests {
         assert_eq!(format_duration(Duration::from_secs(45)), "45s");
         assert_eq!(format_duration(Duration::from_secs(60)), "1m 00s");
         assert_eq!(format_duration(Duration::from_secs(125)), "2m 05s");
+        assert_eq!(format_duration(Duration::from_secs(3600)), "1h 00m 00s");
+        assert_eq!(format_duration(Duration::from_secs(3665)), "1h 01m 05s");
+        assert_eq!(format_duration(Duration::from_secs(7325)), "2h 02m 05s");
     }
 
     #[test]

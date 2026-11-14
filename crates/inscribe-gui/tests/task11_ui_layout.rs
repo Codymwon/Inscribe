@@ -139,6 +139,7 @@ fn test_appwindow_full_ui_acceptance_criteria() {
     let drive_clicked = Arc::new(AtomicBool::new(false));
     let flash_clicked = Arc::new(AtomicBool::new(false));
     let modal_toggled = Arc::new(AtomicBool::new(false));
+    let allow_ssd_changed = Arc::new(AtomicBool::new(false));
 
     {
         let ic = image_clicked.clone();
@@ -164,6 +165,12 @@ fn test_appwindow_full_ui_acceptance_criteria() {
             mt.store(true, Ordering::SeqCst);
         });
     }
+    {
+        let ac = allow_ssd_changed.clone();
+        window.on_allow_external_usb_ssd_changed(move |allowed| {
+            ac.store(allowed, Ordering::SeqCst);
+        });
+    }
 
     // Trigger actions
     window.invoke_select_image_clicked();
@@ -186,4 +193,30 @@ fn test_appwindow_full_ui_acceptance_criteria() {
         modal_toggled.load(Ordering::SeqCst),
         "toggle modal callback fired"
     );
+
+    window.invoke_allow_external_usb_ssd_changed(true);
+    assert!(
+        allow_ssd_changed.load(Ordering::SeqCst),
+        "allow_external_usb_ssd_changed callback fired"
+    );
+
+    // =========================================================================
+    // Acceptance Criteria: Modal Dialogs, Accessibility & Shortcut Guards
+    // =========================================================================
+    // Verify modal overlay states guard the UI
+    window.set_show_drive_modal(true);
+    assert!(window.get_show_drive_modal());
+    window.set_show_drive_modal(false);
+
+    window.set_show_cancel_modal(true);
+    assert!(window.get_show_cancel_modal());
+    window.set_show_cancel_modal(false);
+
+    window.set_show_success_screen(true);
+    assert!(window.get_show_success_screen());
+    window.set_show_success_screen(false);
+
+    window.set_show_error_screen(true);
+    assert!(window.get_show_error_screen());
+    window.set_show_error_screen(false);
 }

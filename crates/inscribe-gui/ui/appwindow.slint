@@ -82,7 +82,9 @@ export component AppWindow inherits Window {
     callback dismiss-cancel-modal-clicked();
     callback dismiss-result-clicked();
     callback toggle-usb-ssd-modal-clicked();
+    callback allow-external-usb-ssd-changed(bool);
     callback file-dropped(string);
+    pure callback data-to-uri(data-transfer) -> string;
 
     forward-focus: main-scope;
 
@@ -105,7 +107,12 @@ export component AppWindow inherits Window {
         KeyBinding {
             keys: @keys(Control + Return);
             activated => {
-                if root.can-flash && !root.is-flashing {
+                if root.can-flash && !root.is-flashing
+                    && !root.show-drive-modal
+                    && !root.show-usb-ssd-modal
+                    && !root.show-cancel-modal
+                    && !root.show-success-screen
+                    && !root.show-error-screen {
                     root.flash-clicked();
                 }
             }
@@ -120,6 +127,7 @@ export component AppWindow inherits Window {
                 }
                 if root.show-usb-ssd-modal {
                     root.show-usb-ssd-modal = false;
+                    root.allow-external-usb-ssd-changed(root.allow-external-usb-ssd);
                 }
                 if root.show-drive-modal {
                     root.show-drive-modal = false;
@@ -243,6 +251,10 @@ export component AppWindow inherits Window {
 
                         dropped(event) => {
                             root.drag-hover-active = false;
+                            let uri = root.data-to-uri(event.data);
+                            if uri != "" {
+                                root.file-dropped(uri);
+                            }
                             return event.proposed-action;
                         }
                     }
@@ -612,6 +624,7 @@ export component AppWindow inherits Window {
                             accessible-label: "Close modal dialog";
                             clicked => {
                                 root.show-usb-ssd-modal = false;
+                                root.allow-external-usb-ssd-changed(root.allow-external-usb-ssd);
                             }
                         }
                     }
@@ -636,6 +649,9 @@ export component AppWindow inherits Window {
                         CheckBox {
                             text: "Allow External USB SSD Enclosures";
                             checked <=> root.allow-external-usb-ssd;
+                            toggled => {
+                                root.allow-external-usb-ssd-changed(self.checked);
+                            }
                         }
 
                         Button {
@@ -645,6 +661,7 @@ export component AppWindow inherits Window {
                             accessible-label: "Save settings and close modal";
                             clicked => {
                                 root.show-usb-ssd-modal = false;
+                                root.allow-external-usb-ssd-changed(root.allow-external-usb-ssd);
                             }
                         }
                     }
@@ -722,21 +739,34 @@ export component AppWindow inherits Window {
                         VerticalLayout {
                             spacing: 8px;
 
-                            for drive[idx] in root.drives: Rectangle {
-                                border-radius: 6px;
-                                background: drive.is-flashable ? (root.selected-drive-index == idx ? #0078d426 : #2d2d31) : #1e1e21;
-                                border-width: 1px;
-                                border-color: drive.is-flashable ? (root.selected-drive-index == idx ? #0078d4 : #3e3e42) : #2a2a2d;
+                            for drive[idx] in root.drives: drive-scope := FocusScope {
+                                enabled: drive.is-flashable;
 
-                                TouchArea {
-                                    enabled: drive.is-flashable;
-                                    accessible-role: button;
-                                    accessible-label: "Select " + drive.name;
-                                    clicked => {
+                                key-pressed(event) => {
+                                    if drive.is-flashable && (event.text == Key.Return || event.text == "\n" || event.text == " ") {
                                         root.drive-selected-by-index(idx);
                                         root.show-drive-modal = false;
+                                        return accept;
                                     }
+                                    return reject;
                                 }
+
+                                Rectangle {
+                                    border-radius: 6px;
+                                    background: drive.is-flashable ? (root.selected-drive-index == idx ? #0078d426 : (drive-scope.has-focus ? #2f3640 : #2d2d31)) : #1e1e21;
+                                    border-width: drive-scope.has-focus ? 2px : 1px;
+                                    border-color: drive-scope.has-focus ? #60cdff : (drive.is-flashable ? (root.selected-drive-index == idx ? #0078d4 : #3e3e42) : #2a2a2d);
+
+                                    TouchArea {
+                                        enabled: drive.is-flashable;
+                                        accessible-role: button;
+                                        accessible-label: "Select " + drive.name;
+                                        clicked => {
+                                            drive-scope.focus();
+                                            root.drive-selected-by-index(idx);
+                                            root.show-drive-modal = false;
+                                        }
+                                    }
 
                                 HorizontalLayout {
                                     padding: 12px;
@@ -872,6 +902,7 @@ export component AppWindow inherits Window {
                             }
                         }
                     }
+                }
 
                     Rectangle {
                         height: 1px;
