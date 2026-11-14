@@ -648,3 +648,56 @@ fn test_macos_character_device_capacity_ioctls() {
     // Overflow protection
     assert_eq!(compute_macos_block_capacity(4096, u64::MAX), None);
 }
+
+#[test]
+fn test_prepare_drive_for_writing_validates_safety_and_invokes_platform_locking() {
+    let sys_drive = DriveInfo {
+        path: PathBuf::from("/dev/nvme0n1"),
+        model: "System NVMe".to_string(),
+        vendor: "Samsung".to_string(),
+        size: 500_000_000_000,
+        sector_size: 512,
+        bus_type: BusType::Nvme,
+        is_removable: false,
+        is_read_only: false,
+        is_system: true,
+        mount_points: vec![PathBuf::from("/")],
+    };
+
+    // System drive must be rejected
+    assert!(inscribe_core::drive::prepare_drive_for_writing(&sys_drive, false).is_err());
+
+    let usb_drive = DriveInfo {
+        path: PathBuf::from("/dev/sdb"),
+        model: "USB Flash".to_string(),
+        vendor: "SanDisk".to_string(),
+        size: 16_000_000_000,
+        sector_size: 512,
+        bus_type: BusType::Usb,
+        is_removable: true,
+        is_read_only: false,
+        is_system: false,
+        mount_points: vec![],
+    };
+
+    // Valid removable drive must succeed
+    assert!(inscribe_core::drive::prepare_drive_for_writing(&usb_drive, false).is_ok());
+
+    let usb_ssd = DriveInfo {
+        path: PathBuf::from("/dev/sdc"),
+        model: "USB SSD".to_string(),
+        vendor: "Samsung".to_string(),
+        size: 1_000_000_000_000,
+        sector_size: 512,
+        bus_type: BusType::Usb,
+        is_removable: false,
+        is_read_only: false,
+        is_system: false,
+        mount_points: vec![],
+    };
+
+    // Blocked without opt-in
+    assert!(inscribe_core::drive::prepare_drive_for_writing(&usb_ssd, false).is_err());
+    // Allowed with opt-in
+    assert!(inscribe_core::drive::prepare_drive_for_writing(&usb_ssd, true).is_ok());
+}

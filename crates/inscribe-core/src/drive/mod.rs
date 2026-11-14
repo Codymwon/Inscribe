@@ -39,6 +39,70 @@ pub fn default_scanner() -> Box<dyn DriveScanner> {
     }
 }
 
+/// Invokes platform volume unmounting and exclusive lock acquisition prior to raw block writing.
+///
+/// Strictly enforces Drive Guard validation before any volume lock or unmount is executed.
+///
+/// # Errors
+/// Returns `InscribeError::DriveGuardViolation` if target is system/internal,
+/// or `InscribeError` if volume unmounting or lock acquisition fails.
+pub fn prepare_drive_for_writing(
+    drive: &DriveInfo,
+    allow_external_usb_ssd: bool,
+) -> Result<(), crate::error::InscribeError> {
+    DriveGuard::validate_target_with_options(drive, allow_external_usb_ssd)?;
+
+    #[cfg(target_os = "windows")]
+    {
+        let _ = windows::WindowsVolumeLockSequence::new()
+            .execute_lock_sequence_with_options(drive, allow_external_usb_ssd)?;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let _ = macos::MacDiskClaim::claim_and_unmount(drive, allow_external_usb_ssd)?;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        unmount_linux_drive_partitions(drive);
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn unmount_linux_drive_partitions(drive: &DriveInfo) {
+    if let Ok(mounts) = linux::LinuxDriveScanner::parse_mounts(std::path::Path::new("/proc/mounts"))
+    {
+        let partitions: Vec<PathBuf> = mounts
+            .into_keys()
+            .filter_map(|dev| {
+                if dev == drive.path || linux::is_partition_of(&drive.path, &dev) {
+                    Some(dev)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if !partitions.is_empty() {
+            if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                rt.block_on(async {
+                    if let Ok(client) = UDisksClient::new().await {
+                        for part in &partitions {
+                            let _ = client.unmount_partition(part).await;
+                        }
+                    }
+                });
+            }
+        }
+    }
+}
+
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
