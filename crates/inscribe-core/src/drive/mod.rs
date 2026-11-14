@@ -73,34 +73,34 @@ pub fn prepare_drive_for_writing(
 
 #[cfg(target_os = "linux")]
 fn unmount_linux_drive_partitions(drive: &DriveInfo) {
-    if let Ok(mounts) = linux::LinuxDriveScanner::parse_mounts(std::path::Path::new("/proc/mounts"))
-    {
-        let partitions: Vec<PathBuf> = mounts
-            .into_keys()
-            .filter_map(|dev| {
-                if dev == drive.path || linux::is_partition_of(&drive.path, &dev) {
-                    Some(dev)
-                } else {
-                    None
-                }
-            })
-            .collect();
+    let Ok(mounts) = linux::LinuxDriveScanner::parse_mounts(std::path::Path::new("/proc/mounts"))
+    else {
+        return;
+    };
 
-        if !partitions.is_empty() {
-            if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                rt.block_on(async {
-                    if let Ok(client) = UDisksClient::new().await {
-                        for part in &partitions {
-                            let _ = client.unmount_partition(part).await;
-                        }
-                    }
-                });
+    let partitions: Vec<PathBuf> = mounts
+        .into_keys()
+        .filter(|dev| dev == &drive.path || linux::is_partition_of(&drive.path, dev))
+        .collect();
+
+    if partitions.is_empty() {
+        return;
+    }
+
+    let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    else {
+        return;
+    };
+
+    rt.block_on(async {
+        if let Ok(client) = UDisksClient::new().await {
+            for part in &partitions {
+                let _ = client.unmount_partition(part).await;
             }
         }
-    }
+    });
 }
 
 use serde::{Deserialize, Serialize};
