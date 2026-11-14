@@ -2,17 +2,16 @@ fn main() {
     println!("cargo:rustc-env=SLINT_STYLE=fluent-dark");
     println!("cargo:rerun-if-changed=ui/appwindow.slint");
 
-    #[cfg(windows)]
-    embed_windows_manifest();
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        embed_windows_manifest();
+    }
 }
 
-#[cfg(windows)]
 fn embed_windows_manifest() {
-    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
-        let mut res = winresource::WindowsResource::new();
-        // Microsoft UAC application manifest with requireAdministrator
-        // Source: https://learn.microsoft.com/en-us/windows/win32/sbscs/application-manifests
-        res.set_manifest(
+    let mut res = winresource::WindowsResource::new();
+    // Microsoft UAC application manifest with requireAdministrator
+    // Source: https://learn.microsoft.com/en-us/windows/win32/sbscs/application-manifests
+    res.set_manifest(
             r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
   <assemblyIdentity version="0.1.0.0" processorArchitecture="*" name="Inscribe.Inscribe" type="win32"/>
@@ -39,9 +38,8 @@ fn embed_windows_manifest() {
 </assembly>
 "#,
         );
-        if let Err(e) = res.compile() {
-            eprintln!("Failed to compile Windows application manifest: {e}");
-            std::process::exit(1);
-        }
+    if let Err(e) = res.compile() {
+        eprintln!("Failed to compile Windows application manifest: {e}");
+        std::process::exit(1);
     }
 }

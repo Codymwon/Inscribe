@@ -37,6 +37,17 @@ fn test_windows_uac_manifest_configured_in_build_script() {
         "Manifest must declare official Microsoft XML assembly namespaces (asm.v1 and asm.v3)"
     );
 
+    // Verify cross-compilation support: CARGO_CFG_TARGET_OS check in main without host #[cfg(windows)]
+    assert!(
+        build_rs_content.contains("CARGO_CFG_TARGET_OS"),
+        "build.rs must inspect CARGO_CFG_TARGET_OS to support cross-compiling from Linux/macOS to Windows"
+    );
+    assert!(
+        !build_rs_content.contains("#[cfg(windows)]\n    embed_windows_manifest")
+            && !build_rs_content.contains("#[cfg(windows)]\nfn embed_windows_manifest"),
+        "build.rs must not gate embed_windows_manifest behind host #[cfg(windows)]"
+    );
+
     // Verify inscribe-gui/Cargo.toml configures winresource dependency
     let cargo_toml_path = root.join("crates/inscribe-gui/Cargo.toml");
     let cargo_toml_content = fs::read_to_string(&cargo_toml_path)
