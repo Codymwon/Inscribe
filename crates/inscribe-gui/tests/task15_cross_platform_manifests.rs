@@ -122,11 +122,14 @@ fn test_linux_policykit_action_specification() {
         "Policy file must define action id (e.g. org.inscribe.pkexec.run)"
     );
 
-    // Verify Active User Authentication requirement (auth_admin or auth_admin_keep)
+    // Verify Active User Authentication requirement (strictly auth_admin without caching)
     assert!(
-        content.contains("<allow_active>auth_admin_keep</allow_active>")
-            || content.contains("<allow_active>auth_admin</allow_active>"),
-        "allow_active must require administrator authentication (auth_admin or auth_admin_keep)"
+        content.contains("<allow_active>auth_admin</allow_active>"),
+        "allow_active must require administrator authentication with auth_admin strictly"
+    );
+    assert!(
+        !content.contains("<allow_active>auth_admin_keep</allow_active>"),
+        "allow_active must not specify auth_admin_keep (mitigate privilege escalation)"
     );
 
     // Verify Freedesktop Polkit Exec path and GUI annotations
@@ -135,8 +138,31 @@ fn test_linux_policykit_action_specification() {
         "Policy file must specify org.freedesktop.policykit.exec.path"
     );
     assert!(
-        content.contains("org.freedesktop.policykit.exec.allow_gui"),
-        "Policy file must specify org.freedesktop.policykit.exec.allow_gui"
+        !content.contains("allow_gui\">true</annotate>"),
+        "Policy file must not permit allow_gui=true (disable full desktop root execution)"
+    );
+}
+
+#[test]
+fn test_appimage_apprun_library_path_hygiene() {
+    let root = workspace_root();
+    let apprun_path = root.join("dist/appimage/AppRun");
+    assert!(
+        apprun_path.exists(),
+        "AppRun script dist/appimage/AppRun must exist"
+    );
+
+    let content = fs::read_to_string(&apprun_path)
+        .unwrap_or_else(|e| panic!("Failed to read {}: {e}", apprun_path.display()));
+
+    // Verify LD_LIBRARY_PATH parameter expansion prevents trailing colons
+    assert!(
+        content.contains("${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"),
+        "AppRun must use ${{LD_LIBRARY_PATH:+:${{LD_LIBRARY_PATH}}}} to prevent trailing colons when unset"
+    );
+    assert!(
+        !content.contains("${HERE}/usr/lib:${LD_LIBRARY_PATH}"),
+        "AppRun must not use direct colon separator which creates trailing colons when LD_LIBRARY_PATH is unset"
     );
 }
 
