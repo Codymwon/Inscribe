@@ -315,6 +315,15 @@ struct ActiveFlash {
     completed_result: Option<Result<FlashSummary, InscribeError>>,
 }
 
+impl Drop for ActiveFlash {
+    fn drop(&mut self) {
+        self.cancel_token.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.thread_handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 /// Central event bridge coordinating Slint UI, hardware scanners, and background workers.
 pub struct GuiBridge {
     window: Weak<AppWindow>,
@@ -374,7 +383,10 @@ impl GuiBridge {
 
         let poller = DrivePoller::start(scanner, interval, move |drives| {
             if let Some(bridge) = bridge_weak.upgrade() {
-                bridge.apply_drive_update(drives);
+                let bridge_inner = bridge.clone();
+                let _ = bridge.window.upgrade_in_event_loop(move |_| {
+                    bridge_inner.apply_drive_update(drives);
+                });
             }
         });
 
@@ -580,7 +592,7 @@ impl GuiBridge {
     /// Launches the background flash worker thread and begins listening to telemetry.
     pub fn handle_flash(self: &Arc<Self>) {
         let (image_path, drive, allow_ssd) = {
-            let mut state = match self.state.lock() {
+            let state = match self.state.lock() {
                 Ok(s) => s,
                 Err(e) => {
                     error!(error = %e, "Failed to lock state for flashing");
@@ -603,9 +615,46 @@ impl GuiBridge {
                 None => return,
             };
 
-            state.set_is_flashing(true);
             (image_path, drive, state.allow_external_usb_ssd())
         };
+
+        // Live target attestation (prevent TOCTOU device swap races)
+        let live_drives = match self.scanner.scan_drives() {
+            Ok(d) => d,
+            Err(e) => {
+                error!(error = %e, "Failed to scan drives for pre-flash attestation");
+                self.apply_flash_error(&e);
+                return;
+            }
+        };
+
+        let live_drive = match live_drives.iter().find(|d| d.path == drive.path) {
+            Some(d) => d,
+            None => {
+                let err = InscribeError::drive_guard_violation(
+                    &drive.path,
+                    format!(
+                        "Target device '{}' disappeared between initial scan and write attempt",
+                        drive.path.display()
+                    ),
+                );
+                error!(error = %err, "Target device missing during pre-flash attestation");
+                self.apply_flash_error(&err);
+                return;
+            }
+        };
+
+        if let Err(err) =
+            inscribe_core::drive::guard::DriveGuard::attest_target(&drive, live_drive, allow_ssd)
+        {
+            error!(error = %err, "Pre-flash Drive Guard attestation failed");
+            self.apply_flash_error(&err);
+            return;
+        }
+
+        if let Ok(mut state) = self.state.lock() {
+            state.set_is_flashing(true);
+        }
 
         let apply_to_win = |win: AppWindow| {
             win.set_is_flashing(true);
@@ -652,13 +701,25 @@ impl GuiBridge {
             });
         }
 
-        let bridge = self.clone();
+        let bridge_weak = Arc::downgrade(self);
         std::thread::Builder::new()
             .name("inscribe-telemetry-bridge".to_string())
             .spawn(move || {
                 while let Ok(progress) = progress_rx_for_bridge.recv() {
-                    bridge.apply_flash_progress(&progress);
+                    if let Some(bridge) = bridge_weak.upgrade() {
+                        let bridge_prog = bridge.clone();
+                        let _ = bridge.window.upgrade_in_event_loop(move |_| {
+                            bridge_prog.apply_flash_progress(&progress);
+                        });
+                    } else {
+                        break;
+                    }
                 }
+
+                let bridge = match bridge_weak.upgrade() {
+                    Some(b) => b,
+                    None => return,
+                };
 
                 // Channel disconnected -> worker finished.
                 // Join worker thread handle on this background worker thread to eliminate
@@ -1118,6 +1179,38 @@ mod tests {
         assert_eq!(
             parse_file_drop_uri(utf8_uri),
             PathBuf::from("/tmp/✓_image.iso")
+        );
+    }
+
+    #[test]
+    fn test_active_flash_drop_cancels_worker_and_joins() {
+        let cancel_token = Arc::new(AtomicBool::new(false));
+        let cancel_clone = cancel_token.clone();
+        let (_progress_tx, progress_rx) = crossbeam_channel::unbounded();
+
+        let thread_handle = std::thread::spawn(move || {
+            for _ in 0..100 {
+                if cancel_clone.load(Ordering::SeqCst) {
+                    return Err(InscribeError::Cancelled);
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(InscribeError::Cancelled)
+        });
+
+        let active = ActiveFlash {
+            cancel_token: cancel_token.clone(),
+            progress_rx,
+            thread_handle: Some(thread_handle),
+            completed_result: None,
+        };
+
+        assert!(!cancel_token.load(Ordering::SeqCst));
+        drop(active);
+        // ActiveFlash drop must have set cancel_token to true and joined the thread
+        assert!(
+            cancel_token.load(Ordering::SeqCst),
+            "ActiveFlash drop must set cancel_token to true"
         );
     }
 }
