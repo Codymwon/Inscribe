@@ -163,19 +163,10 @@ impl AppState {
         let format = detect_format(&header[..bytes_read], Some(&path));
         let inspection = inspect_image(&mut file, format, Some(&path)).ok();
         let (display_size, format_name) = match inspection {
-            Some(meta) => {
-                let size = meta.uncompressed_size.unwrap_or(file_size);
-                let name = match meta.format {
-                    ImageFormat::Raw => "RAW / ISO".to_string(),
-                    ImageFormat::Gz => "Gzip (.gz)".to_string(),
-                    ImageFormat::Xz => "XZ (.xz)".to_string(),
-                    ImageFormat::Zstd => "Zstandard (.zst)".to_string(),
-                    ImageFormat::Bzip2 => "Bzip2 (.bz2)".to_string(),
-                    ImageFormat::Zip => "ZIP (.zip)".to_string(),
-                    ImageFormat::Unknown => "Disk Image".to_string(),
-                };
-                (size, name)
-            }
+            Some(meta) => (
+                meta.uncompressed_size.unwrap_or(file_size),
+                image_format_badge(meta.format).to_string(),
+            ),
             None => (file_size, "Disk Image".to_string()),
         };
 
@@ -200,36 +191,35 @@ impl AppState {
     pub fn set_drives(&mut self, new_drives: Vec<DriveInfo>) -> DriveStateChange {
         self.drives = new_drives;
 
-        if let Some(ref current) = self.selected_drive {
-            let current_path = current.path.clone();
-            if let Some(updated) = self.drives.iter().find(|d| d.path == current_path) {
-                if self.is_drive_flashable(updated) {
-                    self.selected_drive = Some(updated.clone());
-                    DriveStateChange::SelectedDriveUpdated
-                } else {
-                    self.selected_drive = None;
-                    DriveStateChange::SelectedDriveRemoved
-                }
-            } else {
-                self.selected_drive = None;
-                DriveStateChange::SelectedDriveRemoved
+        let Some(ref current) = self.selected_drive else {
+            return DriveStateChange::NoSelectionChange;
+        };
+
+        if let Some(updated) = self.drives.iter().find(|d| d.path == current.path) {
+            if self.is_drive_flashable(updated) {
+                self.selected_drive = Some(updated.clone());
+                return DriveStateChange::SelectedDriveUpdated;
             }
-        } else {
-            DriveStateChange::NoSelectionChange
         }
+
+        self.selected_drive = None;
+        DriveStateChange::SelectedDriveRemoved
     }
 
     /// Selects a target drive by its native device path.
     ///
     /// Returns `true` if the drive was found and is safe/flashable under current safety rules.
     pub fn select_drive(&mut self, path: &Path) -> bool {
-        if let Some(drive) = self.drives.iter().find(|d| d.path == path) {
-            if self.is_drive_flashable(drive) {
-                self.selected_drive = Some(drive.clone());
-                return true;
-            }
+        if let Some(drive) = self
+            .drives
+            .iter()
+            .find(|d| d.path == path && self.is_drive_flashable(d))
+        {
+            self.selected_drive = Some(drive.clone());
+            true
+        } else {
+            false
         }
-        false
     }
 
     /// Clears the currently selected target drive.
@@ -247,6 +237,18 @@ impl AppState {
     #[must_use]
     pub fn can_flash(&self) -> bool {
         self.selected_image.is_some() && self.selected_drive.is_some() && !self.is_flashing
+    }
+}
+
+const fn image_format_badge(format: ImageFormat) -> &'static str {
+    match format {
+        ImageFormat::Raw => "RAW / ISO",
+        ImageFormat::Gz => "Gzip (.gz)",
+        ImageFormat::Xz => "XZ (.xz)",
+        ImageFormat::Zstd => "Zstandard (.zst)",
+        ImageFormat::Bzip2 => "Bzip2 (.bz2)",
+        ImageFormat::Zip => "ZIP (.zip)",
+        ImageFormat::Unknown => "Disk Image",
     }
 }
 
