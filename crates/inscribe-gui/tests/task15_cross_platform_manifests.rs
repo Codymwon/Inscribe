@@ -327,6 +327,10 @@ fn test_cross_platform_toolchain_and_workspace_dependency_hygiene() {
         config_content.contains("[target.x86_64-unknown-linux-gnu]"),
         ".cargo/config.toml must scope target configurations strictly to [target.x86_64-unknown-linux-gnu]"
     );
+    assert!(
+        !config_content.contains("--strip-all"),
+        ".cargo/config.toml rustflags must not contain --strip-all to avoid stripping debuginfo/test binaries"
+    );
 
     // 2. Verify root Cargo.toml does not contain unused slint-build dependency
     let root_cargo_path = root.join("Cargo.toml");
@@ -349,5 +353,11 @@ fn test_cross_platform_toolchain_and_workspace_dependency_hygiene() {
             || wrapper_content.contains("which objcopy")
             || wrapper_content.contains("type objcopy"),
         ".cargo/ld-wrapper.sh must safely check objcopy availability and fallback to CC/gcc"
+    );
+    assert!(
+        wrapper_content.contains("libtest")
+            || wrapper_content.contains("is_test")
+            || wrapper_content.contains("test"),
+        ".cargo/ld-wrapper.sh must guard .eh_frame stripping to exclude test/deps binaries"
     );
 }

@@ -16,8 +16,17 @@ for arg in "$@"; do
     prev="$arg"
 done
 
-# If building a release binary, strip redundant unwinding tables if objcopy is available
-if [ -n "$output" ] && [ -f "$output" ] && [[ "$output" == *"release"* ]]; then
+# If building a release standalone binary, strip redundant unwinding tables if objcopy is available.
+# Exclude test runners (which link libtest) to preserve test backtraces and panic unwinding.
+is_test=0
+for arg in "$@"; do
+    if [[ "$arg" == *"libtest"* ]] || [[ "$arg" == *"test"* ]] || [[ "$arg" == *"task"* ]]; then
+        is_test=1
+        break
+    fi
+done
+
+if [ -n "$output" ] && [ -f "$output" ] && [[ "$output" == *"release"* ]] && [ "$is_test" -eq 0 ]; then
     if command -v objcopy >/dev/null 2>&1; then
         objcopy --remove-section .eh_frame --remove-section .eh_frame_hdr "$output" 2>/dev/null || true
     fi
